@@ -22,7 +22,7 @@ async fn summaries_are_reused_and_full_history_is_preserved() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for turn in 0..6 {
+        for turn in 0..4 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut data = Vec::new();
             let mut buf = [0; 8192];
@@ -45,30 +45,17 @@ async fn summaries_are_reused_and_full_history_is_preserved() {
                 }
             };
             let request = String::from_utf8_lossy(&data[body_start..]);
-            if turn < 3 {
+            let body = if turn == 0 {
+                // One summary request covers the whole older history.
                 assert!(request.contains("Summarize the conversation"));
-                if turn == 0 {
-                    assert!(request.contains("old-important-marker"));
-                } else {
-                    assert!(request.contains("summary-important-marker"));
-                }
+                assert!(request.contains("old-important-marker"));
                 assert!(!request.contains("aW1hZ2UtZml4dHVyZQ=="));
-            } else {
+                summary_response(&checkpoint("summary-important-marker"), "end_turn")
+            } else if turn == 1 {
                 assert!(request.contains("summary-important-marker"));
                 assert!(request.contains("recent-marker"));
                 assert!(!request.contains("old-important-marker"));
                 assert!(request.contains("aW1hZ2UtZml4dHVyZQ=="));
-                if turn >= 4 {
-                    assert!(request.contains("verified after compaction"));
-                }
-            }
-            let text = if turn < 3 {
-                "summary-important-marker"
-            } else {
-                "answer"
-            };
-            let body = format!("data: {{\"type\":\"message_start\",\"message\":{{}}}}\n\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n");
-            let body = if turn == 3 {
                 concat!(
                     "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
                     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"read_1\",\"name\":\"Read\",\"input\":{\"path\":\"example.txt\"}}}\n\n",
@@ -77,7 +64,12 @@ async fn summaries_are_reused_and_full_history_is_preserved() {
                     "data: {\"type\":\"message_stop\"}\n\n",
                 ).to_owned()
             } else {
-                body
+                if turn == 2 {
+                    assert!(request.contains("verified after compaction"));
+                } else {
+                    assert!(request.contains("summary-important-marker"));
+                }
+                summary_response("answer", "end_turn")
             };
             stream
                 .write_all(
@@ -102,7 +94,7 @@ async fn summaries_are_reused_and_full_history_is_preserved() {
         tools: Tools::new(Engine::new(root.path(), Mode::Default).unwrap()),
         model: "fixture".into(),
         system: String::new(),
-        max_turns: 2,
+        max_turns: 4,
         max_tokens: 128,
         compaction: Compaction::new(50_000, 0.6),
     };
@@ -129,7 +121,7 @@ async fn summaries_are_reused_and_full_history_is_preserved() {
     let outcome = agent.run(history, Some(&sender)).await.unwrap();
     assert_eq!(&outcome.messages[..original.len()], original.as_slice());
     assert_eq!(outcome.text, "answer");
-    assert_eq!(outcome.requests, 5);
+    assert_eq!(outcome.requests, 3);
     assert!(outcome.messages.iter().flat_map(|message| &message.content).any(|block|
         matches!(block, Content::ToolResult { content, is_error: false, .. } if content.contains("verified after compaction"))));
     let mut seen_start = false;
@@ -225,6 +217,10 @@ async fn read_json_request(stream: &mut tokio::net::TcpStream) -> serde_json::Va
         }
     }
 }
+fn checkpoint(marker: &str) -> String {
+    format!("## Objective\n- {marker}\n\n## Requirements\n- (none)\n\n## Next Move\n1. (none)")
+}
+
 fn summary_response(text: &str, reason: &str) -> String {
     format!("data: {{\"type\":\"message_start\",\"message\":{{}}}}\n\ndata: {}\n\ndata: {}\n\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\ndata: {}\n\ndata: {{\"type\":\"message_stop\"}}\n\n", serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}), serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}), serde_json::json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"input_tokens":10,"output_tokens":5}}))
 }
@@ -257,7 +253,7 @@ async fn truncated_summary_retries_smaller_chunks_and_keeps_full_history() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for turn in 0..3 {
+        for turn in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_json_request(&mut socket).await;
             assert_eq!(request["output_config"]["effort"], "low");
@@ -270,8 +266,8 @@ async fn truncated_summary_retries_smaller_chunks_and_keeps_full_history() {
             }
             let response = match turn {
                 0 => summary_response("UNFINISHED_SUMMARY", "max_tokens"),
-                1 => summary_response("first completed summary", "end_turn"),
-                _ => summary_response("final completed summary", "end_turn"),
+                1 => summary_response(&checkpoint("first completed summary"), "end_turn"),
+                _ => summary_response(&checkpoint("final completed summary"), "end_turn"),
             };
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
         }
@@ -294,12 +290,12 @@ async fn truncated_summary_retries_smaller_chunks_and_keeps_full_history() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(usage.len(), 3);
+    assert_eq!(usage.len(), 2);
     assert_eq!(request.messages, original);
     assert_eq!(client.effort(), Some("xhigh"));
     assert!(serde_json::to_string(&projection)
         .unwrap()
-        .contains("final completed summary"));
+        .contains("first completed summary"));
     assert!(!serde_json::to_string(&projection)
         .unwrap()
         .contains("UNFINISHED_SUMMARY"));
@@ -397,7 +393,7 @@ async fn explicit_compact_generates_checkpoint_without_mutating_history() {
         let request = read_json_request(&mut socket).await;
         assert!(request.to_string().contains("Summarize the conversation"));
         assert!(request.to_string().contains("keep the test focus"));
-        let response = summary_response("saved checkpoint", "end_turn");
+        let response = summary_response(&checkpoint("saved checkpoint"), "end_turn");
         socket
             .write_all(
                 format!(
@@ -464,7 +460,7 @@ async fn empty_completed_summary_is_retried_once() {
     let server = tokio::spawn(async move {
         for response in [
             summary_response("", "end_turn"),
-            summary_response("checkpoint after retry", "end_turn"),
+            summary_response(&checkpoint("checkpoint after retry"), "end_turn"),
         ] {
             let (mut socket, _) = listener.accept().await.unwrap();
             read_json_request(&mut socket).await;
@@ -496,7 +492,10 @@ async fn oversized_summary_does_not_replace_smaller_context() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_json_request(&mut socket).await;
-        let response = summary_response(&"large summary ".repeat(200), "end_turn");
+        let response = summary_response(
+            &format!("## Objective\n- {}", "large summary ".repeat(200)),
+            "end_turn",
+        );
         socket
             .write_all(
                 format!(
@@ -523,7 +522,7 @@ async fn oversized_summary_does_not_replace_smaller_context() {
         .compact(&client, &request, None, None)
         .await
         .unwrap_err();
-    assert!(error.contains("не уменьшило"));
+    assert!(error.contains("не уменьшило"), "{error}");
     assert_eq!(request.messages, original);
     assert!(compaction.snapshot(&original).unwrap().is_none());
     server.await.unwrap();

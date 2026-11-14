@@ -34,8 +34,10 @@ pub struct Provider {
     pub api_key_env: String,
     /// Enable prompt caching on supported official endpoints.
     pub prompt_cache: bool,
-    /// Hard request timeout in seconds.
+    /// Hard per-attempt timeout in seconds.
     pub timeout_seconds: u64,
+    /// Maximum generated tokens per request; a low value truncates long answers.
+    pub max_tokens: u32,
 }
 
 impl Default for Provider {
@@ -47,6 +49,7 @@ impl Default for Provider {
             api_key_env: "ANTHROPIC_API_KEY".into(),
             prompt_cache: true,
             timeout_seconds: 120,
+            max_tokens: 32_000,
         }
     }
 }
@@ -130,6 +133,11 @@ impl Config {
                 "compaction_threshold",
                 self.compaction_threshold > 0.0 && self.compaction_threshold < 1.0,
                 "must be between zero and one",
+            ),
+            (
+                "provider.max_tokens",
+                self.provider.max_tokens >= 1024,
+                "must be at least 1024 tokens",
             ),
             (
                 "provider.timeout_seconds",
@@ -613,5 +621,6 @@ mod tests {
         let c: Config = v.try_into().unwrap();
         assert_eq!(c.provider.name, "custom");
         assert_eq!(c.provider.timeout_seconds, 120);
+        assert_eq!(c.provider.max_tokens, 32_000);
     }
 }

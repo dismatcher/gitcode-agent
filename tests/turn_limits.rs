@@ -142,3 +142,63 @@ async fn explicit_limit_still_stops_and_retains_completed_tool_results() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn truncated_answer_continues_instead_of_failing_the_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for turn in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let (text, reason) = match turn {
+                0 => ("first half ", "max_tokens"),
+                1 => ("second half ", "max_tokens"),
+                _ => ("done", "end_turn"),
+            };
+            let body = format!("data: {{\"type\":\"message_start\",\"message\":{{}}}}\n\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut agent = agent(root.path(), &format!("http://{address}"), 0);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        agent.run(vec![Message::text(Role::User, "write it all")], None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.text, "first half second half done");
+    assert_eq!(outcome.requests, 3);
+    server.await.unwrap();
+}

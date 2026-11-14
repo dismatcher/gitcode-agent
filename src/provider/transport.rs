@@ -12,10 +12,45 @@ use futures_util::StreamExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+/// Status used to schedule a retry for a request that hit its deadline.
+const TIMEOUT_STATUS: u16 = 408;
+/// Message preserved for callers and the UI that already recognize it.
+const TIMEOUT_MESSAGE: &str = "provider request timed out";
+/// Stable rejection message for a request whose payload exceeds the provider limit.
+pub(crate) const TOO_LARGE_MESSAGE: &str = "provider rejected the request payload as too large";
+/// Stable rejection message for a conversation the provider refuses as too long.
+pub(crate) const TOO_LONG_MESSAGE: &str = "provider rejected the request as too long";
+
 enum WireStream {
     Anthropic(anthropic::Stream),
     Chat(openai_chat::Stream),
     Responses(openai_responses::Stream),
+}
+
+/// Distinguish a rejected request that compaction can shrink from an opaque failure.
+///
+/// A provider that refuses a conversation as too long (or its payload as too large)
+/// is a recoverable condition: the caller shrinks the request and sends it again.
+/// Returning a stable message keeps that decision independent of provider wording.
+pub(crate) fn classify_rejection(body: &str) -> Option<&'static str> {
+    let text = body.to_ascii_lowercase();
+    if text.contains("prompt is too long")
+        || text.contains("context_length_exceeded")
+        || text.contains("context window")
+        || text.contains("context is too long")
+        || text.contains("maximum context")
+        || text.contains("too many tokens")
+        || text.contains("input too long")
+    {
+        return Some(TOO_LONG_MESSAGE);
+    }
+    if text.contains("payload too large")
+        || text.contains("request entity too large")
+        || text.contains("request too large")
+    {
+        return Some(TOO_LARGE_MESSAGE);
+    }
+    None
 }
 
 impl WireStream {
@@ -286,9 +321,7 @@ impl Client {
         request: &Request,
         progress: Option<&mpsc::Sender<Event>>,
     ) -> Result<Vec<Event>, String> {
-        tokio::time::timeout(self.timeout, self.run_inner(request, progress))
-            .await
-            .map_err(|_| "provider request timed out".to_string())?
+        self.run_inner(request, progress).await
     }
 
     async fn run_inner(
@@ -319,6 +352,9 @@ impl Client {
                 }
             }
         }
+        // A deadline that ended the retry loop decides the reported reason: a stalled
+        // generation must not surface as an unrelated connection failure.
+        let mut timed_out = false;
         for attempt in 0..=self.retry.retries {
             let mut builder = self
                 .http
@@ -332,14 +368,27 @@ impl Client {
                     builder.header("x-api-key", secret.expose())
                 };
             }
-            let response = match builder.send().await {
-                Ok(response) => response,
-                Err(error) => {
+            // The deadline belongs to one attempt, not to the whole retry loop: a slow
+            // generation is retried instead of consuming every attempt's budget at once.
+            let response = match tokio::time::timeout(self.timeout, builder.send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
                     // Builder errors are deterministic (for example invalid auth headers).
                     if !error.is_builder() && self.pause(attempt, 503, None, progress).await {
                         continue;
                     }
-                    return Err("provider connection failed".into());
+                    return Err(if timed_out {
+                        TIMEOUT_MESSAGE.into()
+                    } else {
+                        "provider connection failed".to_owned()
+                    });
+                }
+                Err(_) => {
+                    timed_out = true;
+                    if self.pause(attempt, TIMEOUT_STATUS, None, progress).await {
+                        continue;
+                    }
+                    return Err(TIMEOUT_MESSAGE.into());
                 }
             };
             let status = response.status();
@@ -349,28 +398,64 @@ impl Client {
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|value| retry_after(value, SystemTime::now()));
-                // Do not retain a failed response connection during backoff.
-                drop(response);
-                if self.pause(attempt, status.as_u16(), after, progress).await {
+                let code = status.as_u16();
+                // 413 is the payload limit by definition; 400 and 422 need the body to tell
+                // a conversation that is too long from an ordinary invalid request.
+                let classified = match code {
+                    413 => Some(TOO_LARGE_MESSAGE),
+                    400 | 422 => classify_rejection(&self.read_error_body(response).await),
+                    _ => {
+                        drop(response);
+                        None
+                    }
+                };
+                if let Some(message) = classified {
+                    return Err(message.into());
+                }
+                if self.pause(attempt, code, after, progress).await {
                     continue;
                 }
-                return Err(format!("provider HTTP status {}", status.as_u16()));
+                return Err(format!("provider HTTP status {code}"));
             }
             // Existing consumers append deltas and have no reset event. Replayed
             // attempts must therefore stay silent; their validated final result
             // replaces the provisional first-attempt display at the caller.
             let live = if attempt == 0 { progress } else { None };
-            match self.read_stream(response, live).await {
-                Ok(events) => return Ok(events),
-                Err((message, transient)) => {
+            let read = tokio::time::timeout(self.timeout, self.read_stream(response, live)).await;
+            match read {
+                Ok(Ok(events)) => return Ok(events),
+                Ok(Err((message, transient))) => {
                     if transient && self.pause(attempt, 503, None, progress).await {
                         continue;
                     }
                     return Err(message);
                 }
+                Err(_) => {
+                    timed_out = true;
+                    if self.pause(attempt, TIMEOUT_STATUS, None, progress).await {
+                        continue;
+                    }
+                    return Err(TIMEOUT_MESSAGE.into());
+                }
             }
         }
         Err("retry budget exhausted".into())
+    }
+
+    /// Read a bounded error body so a rejected request can be classified without
+    /// retaining the connection or leaking credentials into messages.
+    async fn read_error_body(&self, response: reqwest::Response) -> String {
+        const MAX_ERROR_BODY: usize = 64 * 1024;
+        let mut body = String::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else { break };
+            if body.len().saturating_add(chunk.len()) > MAX_ERROR_BODY {
+                break;
+            }
+            body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        body
     }
 
     async fn pause(

@@ -2,6 +2,16 @@
 
 All notable changes are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-11-14
+
+### Fixed
+
+- Context summarization sends the whole older history in one request instead of 15–47 sequential chunked requests, matching OpenCode 2.2.6. Provider "too long" and "payload too large" rejections now shrink the transcript and retry instead of failing, and a failed summary keeps the existing checkpoint.
+- A turn that reaches the output token limit is continued from the cut-off point (up to three times) instead of failing with `provider turn stopped without completion: max_tokens`.
+- The per-request timeout now bounds each attempt rather than the whole retry loop, so a slow generation is retried instead of ending the turn.
+- `provider.max_tokens` is configurable and defaults to 32,000, which stops long answers from being truncated mid-sentence.
+- Completing a truncated answer collects its whole text rather than only the last part.
+
 ## [0.3.1] - 2026-11-14
 
 ### Added

@@ -84,6 +84,7 @@ impl Policy {
         retry_after: Option<Duration>,
         jitter: u64,
     ) -> Option<Duration> {
+        // 408 covers a client-side deadline as well as the provider's own timeout status.
         if attempt >= self.retries || !matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529) {
             return None;
         }

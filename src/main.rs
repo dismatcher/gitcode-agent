@@ -509,7 +509,7 @@ async fn run(cli: Cli, logger: &mut Logger) -> Result<(), String> {
         model: config.model.clone(),
         system,
         max_turns: config.max_turns,
-        max_tokens: 8192,
+        max_tokens: config.provider.max_tokens,
         compaction: gitcode::agent::context::Compaction::new(
             config.context_window,
             config.compaction_threshold,
