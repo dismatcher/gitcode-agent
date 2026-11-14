@@ -599,7 +599,9 @@ async fn summarize_history(
     let summary_limit = request.max_tokens.min(window_limit);
     let mut request_usage = Vec::new();
     // Characters the transcript may occupy; the ladder lowers it after each rejection.
-    let mut budget = usize::try_from(window.min(1_000_000)).unwrap_or(usize::MAX) * 2;
+    let mut budget = usize::try_from(window.min(1_000_000))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(3);
     let mut rejections = 0usize;
     let mut level = 0usize;
     let mut as_text = false;
@@ -608,6 +610,13 @@ async fn summarize_history(
     loop {
         let prompt = summary_prompt(previous, instructions, as_text);
         let transcript = flatten_transcript(data, level, budget);
+        // Nothing recoverable is left to summarize: never send an empty request.
+        if transcript.trim().is_empty() && level >= TRANSCRIPT_LEVELS - 1 {
+            return Err(
+                "не удалось сжать контекст: история не помещается в один запрос; полная история сохранена"
+                    .into(),
+            );
+        }
         let mut summary_request = Request {
             model: request.model.clone(),
             system: "Produce a faithful, concise working checkpoint of the supplied conversation. Do not use tools.".into(),
