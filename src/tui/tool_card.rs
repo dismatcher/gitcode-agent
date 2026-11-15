@@ -216,7 +216,7 @@ pub fn completed_agent(
                     if mode != crate::theme::ColorMode::None
                         && span.role == super::markdown::Role::Italic
                     {
-                        body.push_str("\x1b[3m");
+                        body.push_str(&crate::theme::foreground(theme.rose_soft, mode));
                     }
                     body.push_str(&piece);
                     if mode != crate::theme::ColorMode::None
@@ -227,7 +227,7 @@ pub fn completed_agent(
                     if mode != crate::theme::ColorMode::None
                         && span.role == super::markdown::Role::Italic
                     {
-                        body.push_str("\x1b[23m");
+                        body.push_str(&crate::theme::foreground(theme.placeholder, mode));
                     }
                 }
                 if clipped {
@@ -368,6 +368,24 @@ mod tests {
         let plain_rows = completed_agent(output, 80, &theme, ColorMode::None);
         assert!(!plain_rows[0].contains('\x1b'));
         assert!(plain_rows[0].contains("ОС: Ubuntu"));
+    }
+
+    #[test]
+    fn agent_emphasis_avoids_terminal_standout() {
+        use crate::theme::{foreground, ColorMode, Theme};
+        let theme = Theme::default();
+        let rows = completed_agent(
+            "- *«текст»* и context_window_value",
+            80,
+            &theme,
+            ColorMode::TrueColor,
+        );
+        assert!(rows[0].contains(&format!(
+            "{}«текст»",
+            foreground(theme.rose_soft, ColorMode::TrueColor)
+        )));
+        assert!(!rows[0].contains("\x1b[3m"));
+        assert!(plain(&rows[0]).contains("context_window_value"));
     }
 
     #[test]

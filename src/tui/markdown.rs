@@ -487,7 +487,23 @@ pub(super) fn inline(text: &str) -> Vec<Span> {
         };
         if let Some((delimiter, role)) = emphasis {
             let start = delimiter.len();
-            if let Some(end) = remaining[start..].find(delimiter).filter(|end| *end > 0) {
+            let previous = text[..text.len() - remaining.len()].chars().next_back();
+            let underscore_can_open = !delimiter.starts_with('_')
+                || !previous.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+            let end = underscore_can_open
+                .then(|| {
+                    remaining[start..]
+                        .match_indices(delimiter)
+                        .find_map(|(end, _)| {
+                            let next = remaining[start + end + start..].chars().next();
+                            (end > 0
+                                && (!delimiter.starts_with('_')
+                                    || !next.is_some_and(|ch| ch.is_alphanumeric() || ch == '_')))
+                            .then_some(end)
+                        })
+                })
+                .flatten();
+            if let Some(end) = end {
                 if !plain.is_empty() {
                     out.push(span(&std::mem::take(&mut plain), Role::Text));
                 }
@@ -792,9 +808,8 @@ fn paint(spans: &[Span], theme: &Theme, mode: ColorMode) -> String {
         if matches!(s.role, Role::Bold | Role::Heading) {
             out.push_str("\x1b[1m");
         }
-        if s.role == Role::Italic {
-            out.push_str("\x1b[3m");
-        }
+        // SGR 3 is standout (often reverse video) in terminals advertising
+        // TERM=screen. The soft accent conveys emphasis without that ambiguity.
         if s.role == Role::Link {
             out.push_str("\x1b[4m");
         }

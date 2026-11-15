@@ -182,9 +182,31 @@ fn emphasis_is_styled_and_plain_text_has_no_markers() {
     let rows = parser.render(100, &Theme::default(), ColorMode::TrueColor);
     assert!(rows[0].contains("\x1b[1mЗаголовок"));
     assert!(rows[1].contains("\x1b[1mжирный"));
-    assert!(rows[1].contains("\x1b[3mкурсив"));
+    assert!(rows[1].contains(&format!(
+        "{}курсив",
+        gitcode::theme::foreground(Theme::default().rose_soft, ColorMode::TrueColor)
+    )));
+    assert!(!rows[1].contains("\x1b[3m"));
     assert!(rows[1].contains("\x1b[4mссылка"));
     assert!(!plain(&parser, 100).join("\n").contains("**"));
+}
+
+#[test]
+fn quotes_and_identifiers_do_not_create_spurious_terminal_highlights() {
+    let text = "- Хуки: *«The executable does not yet dispatch the full lifecycle hook set»*.\n- Фон: *«Background agents continue»*.\nОбычный идентификатор context_window_value и _курсив_.";
+    let parser = parse(text);
+    let rows = parser.render(120, &Theme::default(), ColorMode::TrueColor);
+    let rendered = rows.join("\n");
+    assert!(!rendered.contains("\x1b[3m"));
+    assert!(!rendered.contains("\x1b[7m"));
+    assert!(!rendered.contains("\x1b[48;"));
+    let plain_text = plain(&parser, 120).join("\n");
+    assert!(plain_text.contains("context_window_value"));
+    assert!(
+        plain_text.contains("«The executable does not yet dispatch the full lifecycle hook set»")
+    );
+    assert!(plain_text.contains("«Background agents continue»"));
+    assert!(plain_text.contains("курсив"));
 }
 
 #[test]
