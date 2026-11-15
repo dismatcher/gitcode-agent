@@ -575,23 +575,20 @@ pub async fn execute_command(
             "/doctor полная диагностика"
         }
         "context" => {
-            let sys_tokens = (agent.system.len() as u64).div_ceil(3);
-            let definitions = crate::tools::Tools::definitions();
-            let tools_tokens = (serde_json::to_vec(&definitions)
-                .map_err(io::Error::other)?
-                .len() as u64)
-                .div_ceil(3);
-            let msg_tokens = agent
-                .compaction
-                .estimate_projection(messages)
-                .map_err(io::Error::other)?;
-            let used = sys_tokens
-                .saturating_add(tools_tokens)
-                .saturating_add(msg_tokens);
-            body.push("Оценка по размеру данных; реальный расход и состав инструментов зависят от модели.".into());
-            let window = agent.compaction.window.max(1);
+            let estimate = super::statusbar::ContextEstimate::calculate(
+                &agent.compaction,
+                &agent.system,
+                messages,
+            )
+            .map_err(io::Error::other)?;
+            let sys_tokens = estimate.system;
+            let tools_tokens = estimate.tools;
+            let msg_tokens = estimate.messages;
+            let used = estimate.used();
+            let window = estimate.window;
             let free = window.saturating_sub(used);
-            let ratio = (used as f64 / window as f64).clamp(0.0, 1.0);
+            let ratio = estimate.ratio();
+            body.push("Оценка по размеру данных; реальный расход и состав инструментов зависят от модели.".into());
             body.push(format!(
                 "Занято контекста: ~{} из {} токенов ({:.1}%)",
                 compact(used),

@@ -1066,6 +1066,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
         &Theme::default(),
         mode,
     ))?;
+    super::statusbar::update_context(&mut status, agent, &messages);
     let queue = InputQueue::default();
     let background_handles = agent.tools.background_handles();
     let mut exit_armed = false;
@@ -1226,6 +1227,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     };
                     messages.clear();
                     agent.compaction.clear();
+                    super::statusbar::update_context(&mut status, agent, &messages);
                     queue.clear();
                     status.queued_prompts.clear();
                     status.queued = 0;
@@ -1467,6 +1469,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     queued_prompts: status.queued_prompts.clone(),
                                     ..Status::default()
                                 };
+                                super::statusbar::update_context(&mut status, agent, &messages);
                                 let mut body = vec![
                                     format!("Открыта сессия {id} · сообщений: {count}"),
                                     "Новые сообщения будут сохранены в выбранный чат.".into(),
@@ -1660,6 +1663,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                             "Не удалось сохранить сжатый контекст; полная история сохранена".into(),
                         );
                     }
+                    super::statusbar::update_context(&mut status, agent, &messages);
                     continue;
                 }
                 let previous_model = agent.model.clone();
@@ -1696,6 +1700,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                         }
                     }
                     renderer.finalize_card(&card)?;
+                    super::statusbar::update_context(&mut status, agent, &messages);
                     continue;
                 }
                 renderer.finalize_styled(&format_user_turn(
@@ -1710,6 +1715,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     user_message.content.push(image);
                 }
                 request.push(user_message);
+                super::statusbar::update_context(&mut status, agent, &request);
                 let (sender, mut progress) = mpsc::channel(256);
                 let (approval_sender, mut approvals) = mpsc::channel(1);
                 let mut approval: Option<super::approval_picker::Pending> = None;
@@ -2096,6 +2102,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     }
                     messages = recovered;
                 }
+                super::statusbar::update_context(&mut status, agent, &messages);
                 if save_compaction_checkpoint(agent, &persistence, &messages)
                     .await
                     .is_err()
@@ -2124,6 +2131,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     &mut status,
                 )
                 .await?;
+                super::statusbar::update_context(&mut status, agent, &messages);
             }
             Action::None => {}
             _ => exit_armed = false,

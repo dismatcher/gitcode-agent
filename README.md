@@ -72,6 +72,8 @@ Other providers require a matching protocol, endpoint, model and credential-vari
 
 ## <img src="assets/icons/layers.svg" alt="" width="20" height="20"> Context and sessions
 
+The green `ctx` bar and `/context` estimate the current model-facing prompt, including the system instructions, tools, and the projected conversation. They do not add up tokens spent across requests; after compaction the estimate can decrease.
+
 `context_window` must match the model's available window; `compaction_threshold` controls when automatic summarization begins. Context sizes are estimates, not provider token guarantees. The recent tail is kept according to a token budget, and the summary checkpoint is reused only when it still matches the original history. `/compact` accepts optional focus instructions. See [configuration](docs/configuration.md) for costs and limits.
 
 Use `gitcode --continue` or `/resume` to return to a session. `/import` can copy supported conversations into the current project; imported source journals are retained privately. See `/help` for current commands.

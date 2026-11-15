@@ -2,6 +2,53 @@
 
 use super::clip;
 
+/// A shared estimate of the context sent to the model, excluding reserved output.
+pub(crate) struct ContextEstimate {
+    pub system: u64,
+    pub tools: u64,
+    pub messages: u64,
+    pub window: u64,
+}
+
+impl ContextEstimate {
+    pub fn calculate(
+        compaction: &crate::agent::context::Compaction,
+        system: &str,
+        messages: &[crate::provider::canonical::Message],
+    ) -> Result<Self, String> {
+        let definitions = crate::tools::Tools::definitions();
+        Ok(Self {
+            system: (system.len() as u64).div_ceil(3),
+            tools: (serde_json::to_vec(&definitions)
+                .map_err(|_| "cannot estimate tools")?
+                .len() as u64)
+                .div_ceil(3),
+            messages: compaction.estimate_projection(messages)?,
+            window: compaction.window.max(1),
+        })
+    }
+
+    pub fn used(&self) -> u64 {
+        self.system
+            .saturating_add(self.tools)
+            .saturating_add(self.messages)
+    }
+
+    pub fn ratio(&self) -> f64 {
+        (self.used() as f64 / self.window as f64).clamp(0.0, 1.0)
+    }
+}
+
+pub(crate) fn update_context(
+    status: &mut Status,
+    agent: &crate::agent::Agent,
+    messages: &[crate::provider::canonical::Message],
+) {
+    status.context_percent = ContextEstimate::calculate(&agent.compaction, &agent.system, messages)
+        .ok()
+        .map(|estimate| estimate.ratio() * 100.0);
+}
+
 /// Provider-independent values for the always-visible live status row.
 #[derive(Debug, Clone, Default)]
 pub struct Status {
@@ -148,5 +195,46 @@ impl Status {
             "{}{right}",
             super::widgets::fit(&left, width - right.width())
         )
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::agent::context::Compaction;
+    use crate::provider::canonical::{Message, Role};
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn context_tracks_current_projection_and_falls_after_compaction_and_clear() {
+        let messages = vec![
+            Message::text(Role::User, "old context ".repeat(10_000)),
+            Message::text(Role::Assistant, "recent answer"),
+        ];
+        let mut compaction = Compaction::new(200_000, 0.9);
+        let empty = ContextEstimate::calculate(&compaction, "system", &[]).unwrap();
+        let full = ContextEstimate::calculate(&compaction, "system", &messages).unwrap();
+        assert!(full.ratio() > empty.ratio());
+        let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&messages[..1]).unwrap()).into();
+        let checkpoint = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "boundary": 1, "digest": digest, "text": "summary"
+        }))
+        .unwrap();
+        assert!(compaction.restore(&checkpoint, &messages));
+        let compacted = ContextEstimate::calculate(&compaction, "system", &messages).unwrap();
+        assert!(compacted.ratio() < full.ratio());
+        assert!(compacted.ratio() >= empty.ratio());
+        compaction.clear();
+        let cleared = ContextEstimate::calculate(&compaction, "system", &[]).unwrap();
+        assert_eq!(cleared.used(), empty.used());
+        let mut status = Status {
+            context_percent: Some(full.ratio() * 100.0),
+            ..Status::default()
+        };
+        let line = status.line(100);
+        assert!(line.contains(&format!("ctx {:.0}%", full.ratio() * 100.0)));
+        status.context_percent = Some(200.0);
+        assert!(status.line(100).contains("ctx 100%"));
     }
 }

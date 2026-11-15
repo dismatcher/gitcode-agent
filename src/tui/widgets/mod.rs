@@ -206,7 +206,7 @@ pub(crate) fn style_live_row(row: &str, theme: &Theme, mode: ColorMode, elapsed_
                     foreground(theme.warn, mode),
                     &rest[..end],
                     foreground(theme.placeholder, mode),
-                    &rest[end..],
+                    style_frame_row(&rest[end..], theme, mode),
                     reset(mode)
                 );
             }
@@ -373,6 +373,18 @@ pub fn style_frame_row_with_panel(
         None
     };
     let output_span = output_token_span(&row);
+    // The status line is laid out as plain text first so ANSI escapes never
+    // affect clipping or cursor positions. Color only its filled context cells.
+    let context_filled = row.find("ctx ").and_then(|start| {
+        let after_label = start + "ctx ".len();
+        let bar = row[after_label..].find(' ')? + after_label + 1;
+        let len = row[bar..]
+            .chars()
+            .take_while(|ch| matches!(ch, '▮' | '#'))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        (len > 0).then_some((bar, bar + len))
+    });
     let placeholder_start = if row.contains(" › Спроси, или / для команд")
         || row.contains(" > Спроси, или / для команд")
     {
@@ -409,6 +421,13 @@ pub fn style_frame_row_with_panel(
                 styled.push_str(&foreground(theme.rose, mode));
             }
             if index == end {
+                styled.push_str(&row_text);
+            }
+        }
+        if let Some((start, end)) = context_filled {
+            if index == start {
+                styled.push_str(&foreground(theme.ok, mode));
+            } else if index == end {
                 styled.push_str(&row_text);
             }
         }
@@ -647,6 +666,36 @@ mod tests {
                     assert!(rows
                         .iter()
                         .all(|row| !row.contains(['╭', '╮', '╰', '╯', '│', '─'])));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn context_filled_cells_are_green_and_plain_mode_preserves_text() {
+        let theme = Theme::default();
+        for row in [
+            "ctx 30% ▮▮▮▯▯▯▯▯▯▯ │ main",
+            "ctx 30% ###------- │ main",
+            "12 ток/с │ 1 в фоне │ ctx 30% ▮▮▮▯▯▯▯▯▯▯ │ main",
+        ] {
+            for mode in [
+                ColorMode::TrueColor,
+                ColorMode::Indexed256,
+                ColorMode::Ansi16,
+                ColorMode::None,
+            ] {
+                let styled = style_live_row(row, &theme, mode, 0);
+                assert_eq!(unstyled(&styled), row);
+                if mode == ColorMode::None {
+                    assert_eq!(styled, row);
+                } else {
+                    let marker = if row.contains('▮') {
+                        "▮▮▮"
+                    } else {
+                        "###"
+                    };
+                    assert!(styled.contains(&format!("{}{marker}", foreground(theme.ok, mode))));
                 }
             }
         }
