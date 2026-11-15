@@ -30,11 +30,143 @@ pub struct Tools {
     /// Monotonic counter for background shell job identifiers.
     next_job_id: u64,
     job_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Results of background jobs that finished on their own, awaiting delivery to the model.
+    completed: Arc<Mutex<Vec<BackgroundCompletion>>>,
+    /// Human-readable label and command for each live job.
+    job_labels: BTreeMap<String, (String, String)>,
     todos: crate::agent::agency::TodoList,
     approved_shell_prefixes: Vec<String>,
     shell_selection: String,
     hooks: Vec<crate::extensibility::HookRule>,
     mcp_stdio: BTreeMap<String, (crate::mcp::McpServerConfig, crate::mcp::StdioMcpSession)>,
+}
+
+/// A finished background job waiting to be delivered to the model.
+#[derive(Debug, Clone)]
+pub struct BackgroundCompletion {
+    /// Human-readable job label.
+    pub label: String,
+    /// Executed command.
+    pub command: String,
+    /// Captured output.
+    pub output: String,
+    /// Whether the job should be reported as a failure.
+    pub is_error: bool,
+    /// Exit code when the job exited normally.
+    pub exit_code: Option<i32>,
+    /// Whether the job hit its timeout.
+    pub timed_out: bool,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Short, readable label such as `cargo-build` taken from the command line.
+fn job_label(command: &str) -> String {
+    let lowered = command.trim().to_ascii_lowercase();
+    let mut words: Vec<&str> = lowered
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '>'))
+        .filter(|word| {
+            !word.is_empty()
+                && !matches!(
+                    *word,
+                    "sudo" | "env" | "nohup" | "time" | "then" | "do" | "cd" | "&&" | "||" | "exec"
+                )
+                && !word.starts_with('#')
+        })
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.is_empty() {
+        return "command".into();
+    }
+    if words[0] == "cargo" && words.len() > 1 {
+        words.truncate(2);
+    } else {
+        words.truncate(1);
+    }
+    let label: String = words.join("-");
+    label.chars().take(24).collect()
+}
+
+impl Tools {
+    /// Register a fresh background session job and start its completion watcher.
+    async fn register_background(
+        &mut self,
+        session: &shell::Session,
+        command: &str,
+        timeout: Duration,
+        permissions: &Engine,
+    ) -> Result<String, String> {
+        let (job, watch) = session
+            .background_watched(permissions, command, timeout)
+            .await?;
+        Ok(self.spawn_watcher(job, watch, command))
+    }
+
+    /// Adopt a job that already started as a foreground command and keep reporting it.
+    async fn adopt_background(
+        &mut self,
+        job: shell::Job,
+        command: &str,
+        _timeout: Duration,
+        _permissions: &Engine,
+    ) -> Result<String, String> {
+        let watch = job.completion_watch();
+        Ok(self.spawn_watcher(job, watch, command))
+    }
+
+    /// Store the job, watch it, and return its label.
+    fn spawn_watcher(
+        &mut self,
+        job: shell::Job,
+        mut watch: tokio::sync::watch::Receiver<Option<shell::CompletedJob>>,
+        command: &str,
+    ) -> String {
+        let job_id = format!("job-{}", self.next_job_id);
+        self.next_job_id += 1;
+        let label = format!("{}-{}", job_label(command), self.next_job_id - 1);
+        if let Some(handle) = job.completion_handle() {
+            self.job_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(handle);
+        }
+        self.job_labels
+            .insert(job_id.clone(), (label.clone(), command.to_owned()));
+        self.jobs.insert(job_id.clone(), job);
+        let completed = self.completed.clone();
+        let watcher_label = label.clone();
+        let watcher_command = command.to_owned();
+        tokio::spawn(async move {
+            // Wait for the worker to publish its outcome; no polling involved.
+            if watch.changed().await.is_err() {
+                return;
+            }
+            let Some(outcome) = watch.borrow_and_update().clone() else {
+                return;
+            };
+            let is_error = shell::Job::failed(&outcome);
+            let describe = shell::Job::describe(&outcome);
+            let mut text = outcome.output;
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&format!("[{describe}]"));
+            completed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackgroundCompletion {
+                    label: watcher_label,
+                    command: watcher_command,
+                    output: text,
+                    is_error,
+                    exit_code: outcome.exit_code,
+                    timed_out: outcome.timed_out,
+                    duration_ms: outcome.elapsed_ms,
+                });
+        });
+        label
+    }
 }
 
 impl Tools {
@@ -47,6 +179,8 @@ impl Tools {
             jobs: BTreeMap::new(),
             next_job_id: 1,
             job_handles: Arc::new(Mutex::new(Vec::new())),
+            completed: Arc::new(Mutex::new(Vec::new())),
+            job_labels: BTreeMap::new(),
             todos: crate::agent::agency::TodoList::new(),
             approved_shell_prefixes: Vec::new(),
             shell_selection: "auto".into(),
@@ -68,6 +202,25 @@ impl Tools {
     /// Shared completion handles for reporting active background jobs.
     pub fn background_handles(&self) -> Arc<Mutex<Vec<tokio::task::AbortHandle>>> {
         self.job_handles.clone()
+    }
+
+    /// Take every background result that arrived since the last call.
+    ///
+    /// The agent drains this at each request boundary, so completion reaches the
+    /// conversation by itself instead of being polled for.
+    pub fn take_completed(&self) -> Vec<BackgroundCompletion> {
+        let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *completed)
+    }
+
+    /// Map a label, prefix, or internal identifier to the live job identifier.
+    fn resolve_job(&self, requested: &str) -> Option<String> {
+        if self.jobs.contains_key(requested) {
+            return Some(requested.to_owned());
+        }
+        self.job_labels.iter().find_map(|(id, (label, command))| {
+            (label == requested || command == requested).then(|| id.clone())
+        })
     }
 
     /// Stop owned background jobs and reap the persistent interpreter before
@@ -137,20 +290,14 @@ impl Tools {
             ),
             tool(
                 "Bash",
-                "Execute a command in a persistent non-interactive shell. Long commands yield a job ID after yield_time_ms; use BashOutput to await the result. Explicit background commands use a separate shell.",
+                "Execute a command in a persistent non-interactive shell. A command still running after yield_time_ms becomes a background task; its result is delivered into the conversation automatically when it finishes, so do not poll for it. Use run_in_background for long independent work.",
                 json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1},"yield_time_ms":{"type":"integer","minimum":1,"maximum":60000},"run_in_background":{"type":"boolean"}}),
                 &["command"],
             ),
             tool(
-                "BashOutput",
-                "Read incremental output from a background job. Set wait_ms to wait for completion without running sleep; use a bounded wait and continue other useful work while it runs.",
-                json!({"job_id":{"type":"string"},"filter":{"type":"string"},"wait_ms":{"type":"integer","minimum":1,"maximum":60000}}),
-                &["job_id"],
-            ),
-            tool(
                 "KillShell",
-                "Terminate an active background shell job.",
-                json!({"job_id":{"type":"string"}}),
+                "Stop a running background task by its label, for example `cargo-build-1`.",
+                json!({"job_id":{"type":"string","description":"Task label returned when it started"}}),
                 &["job_id"],
             ),
         ]
@@ -373,19 +520,12 @@ impl Tools {
                         &home,
                         &self.shell_selection,
                     )?;
-                    let job = bg_session
-                        .background(&shell_permissions, command, timeout)
+                    let label = self
+                        .register_background(&bg_session, command, timeout, &shell_permissions)
                         .await?;
-                    let job_id = format!("job-{}", self.next_job_id);
-                    self.next_job_id += 1;
-                    if let Some(handle) = job.completion_handle() {
-                        self.job_handles
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(handle);
-                    }
-                    self.jobs.insert(job_id.clone(), job);
-                    return Ok(format!("Started background shell job {job_id}"));
+                    return Ok(format!(
+                        "Started background command {label} (`{command}`). Its result will appear in the conversation automatically; continue with other work meanwhile. Use KillShell to stop it."
+                    ));
                 }
                 let session = self.ensure_shell()?;
                 let mut job = session
@@ -398,16 +538,12 @@ impl Tools {
                 job.wait_ready(Duration::from_millis(wait)).await;
                 if !job.is_finished() {
                     let initial = job.poll()?;
-                    let job_id = format!("job-{}", self.next_job_id);
-                    self.next_job_id += 1;
-                    if let Some(handle) = job.completion_handle() {
-                        self.job_handles
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(handle);
-                    }
-                    self.jobs.insert(job_id.clone(), job);
-                    return Ok(bound(format!("Command continues as background shell job {job_id}. Use BashOutput to wait for its result.\n{initial}")));
+                    let label = self
+                        .adopt_background(job, command, timeout, &shell_permissions)
+                        .await?;
+                    return Ok(bound(format!(
+                        "Command still running as background task {label}. Its result will appear in the conversation automatically; continue with other work meanwhile.\n{initial}"
+                    )));
                 }
                 let out = job.wait().await?;
                 let mut text = out.output;
@@ -423,47 +559,23 @@ impl Tools {
                 }
                 return Ok(bound(text));
             }
-            "BashOutput" => {
-                let job_id = required(input, "job_id")?;
-                let job = self
-                    .jobs
-                    .get_mut(job_id)
-                    .ok_or_else(|| format!("unknown background job: {job_id}"))?;
-                if let Some(ms) = input["wait_ms"].as_u64() {
-                    job.wait_ready(Duration::from_millis(ms.clamp(1, 60_000)))
-                        .await;
-                }
-                if job.is_finished() {
-                    job.wait_ready(Duration::from_millis(1)).await;
-                }
-                let chunk = job.poll()?;
-                let finished = job.is_finished();
-                let outcome = job
-                    .completion_status()
-                    .map_or_else(String::new, |s| format!(" {s}"));
-                let filtered = if let Some(pattern) = input["filter"].as_str() {
-                    let re = regex::RegexBuilder::new(pattern)
-                        .size_limit(4 * 1024 * 1024)
-                        .build()
-                        .map_err(|_| "invalid filter regular expression")?;
-                    chunk
-                        .lines()
-                        .filter(|line| re.is_match(line))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    chunk
-                };
-                return Ok(bound(format!("finished={finished}{outcome}\n{filtered}")));
-            }
             "KillShell" => {
-                let job_id = required(input, "job_id")?;
+                let requested = required(input, "job_id")?;
+                let job_id = self
+                    .resolve_job(requested)
+                    .ok_or_else(|| format!("unknown background task: {requested}"))?;
+                let label = self
+                    .job_labels
+                    .get(&job_id)
+                    .map(|(label, _)| label.clone())
+                    .unwrap_or_else(|| job_id.clone());
                 let job = self
                     .jobs
-                    .remove(job_id)
-                    .ok_or_else(|| format!("unknown background job: {job_id}"))?;
+                    .remove(&job_id)
+                    .ok_or_else(|| format!("unknown background task: {requested}"))?;
+                self.job_labels.remove(&job_id);
                 job.kill().await?;
-                return Ok(format!("Killed background shell job {job_id}"));
+                return Ok(format!("Stopped background task {label}"));
             }
             _ => {}
         }

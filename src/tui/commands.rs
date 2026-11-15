@@ -150,8 +150,8 @@ pub fn next_permission_mode(mode: Mode) -> Mode {
 
 /// Cycle the active permission mode without adding transcript output.
 pub fn cycle_permission(agent: &mut Agent, status: &mut Status) {
-    let next = next_permission_mode(agent.tools.permissions.mode);
-    agent.tools.permissions.mode = next;
+    let next = next_permission_mode(agent.tools.permissions.mode());
+    agent.tools.permissions.set_mode(next);
     status.permission = permission_label(next).into();
     status.toast = None;
 }
@@ -748,7 +748,7 @@ pub async fn execute_command(
             "/rewind <индекс-сообщения> удалить контекст начиная с индекса"
         }
         "plan" => {
-            agent.tools.permissions.mode = Mode::Plan;
+            agent.tools.permissions.set_mode(Mode::Plan);
             status.permission = "PLAN".into();
             body.extend([
                 "Режим планирования [PLAN] активирован.".into(),

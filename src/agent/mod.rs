@@ -34,7 +34,7 @@ Do not end a sentence with a colon before a tool call; finish it with a period. 
 Your final message of a turn leads with the outcome in the first sentence: what changed, what you found, or what failed. Supporting detail comes after.
 
 # Working style
-Take ownership of the requested outcome: inspect the actual workspace, preserve unrelated changes, implement the complete authorized task, and run checks suited to the change. Do not ask for routine decisions that can be inferred. Explain material blockers and incomplete work honestly. Keep updates concise and useful. Prioritize correctness, avoid unnecessary work and batch independent reads. Bash yields a job ID automatically when a command takes longer than yield_time_ms. For known long commands use run_in_background, continue independent work, then call BashOutput with wait_ms instead of running sleep or repeatedly polling. Never claim a job passed before it completes. When subagents run in the background, continue independent work and respond to incoming user messages; their results are delivered when ready.
+Take ownership of the requested outcome: inspect the actual workspace, preserve unrelated changes, implement the complete authorized task, and run checks suited to the change. Do not ask for routine decisions that can be inferred. Explain material blockers and incomplete work honestly. Keep updates concise and useful. Prioritize correctness, avoid unnecessary work and batch independent reads. Bash reports long-running work as a background task automatically: when it finishes, its result arrives in the conversation on its own, so continue with other work and never poll for it. Never claim a job passed before its completion arrives. When subagents run in the background, continue independent work and respond to incoming user messages; their results are delivered when ready.
 Read with search tools before opening a file you only need one fact from. Prefer dedicated file and search tools over shell commands when one fits. Run independent tool calls in parallel in one response; run them sequentially only when a later call needs an earlier result.
 Choose existing or new files according to the task and the project conventions. Avoid unnecessary changes and explain non-obvious constraints when useful.
 When a user requests action, carry it through rather than only explaining how. For informational questions, answer directly. For exploratory questions give a recommendation and the main tradeoff in a few sentences.
@@ -292,6 +292,26 @@ impl TurnCheckpoint {
         state.streaming = streaming;
     }
 
+    /// Current conversation snapshot, including partially streamed assistant text.
+    pub fn snapshot(&self) -> Vec<Message> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages
+            .clone()
+    }
+
+    /// Messages that are safe to journal now: a trailing assistant reply that is still
+    /// streaming may grow, so it is left in memory until the turn commits it.
+    pub fn stable(&self) -> Vec<Message> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut messages = state.messages.clone();
+        if state.streaming && messages.last().is_some_and(|m| m.role == Role::Assistant) {
+            messages.pop();
+        }
+        messages
+    }
+
     /// Recover completed steps and any visible partial response after cancellation.
     pub fn interrupted(&self, partial: &str) -> Vec<Message> {
         self.recover(
@@ -470,6 +490,8 @@ impl Agent {
             while let Some(child) = children.try_join_next() {
                 record_background_child(child, &mut messages, &mut usage, &mut request_usage);
             }
+            // Completed background commands enter the conversation on their own.
+            deliver_background(&self.tools, &mut messages, progress);
             if let Some(checkpoint) = checkpoint {
                 checkpoint.update(messages.clone(), true);
             }
@@ -616,7 +638,8 @@ impl Agent {
                     | Event::SteeringApplied { .. }
                     | Event::SubagentStarted { .. }
                     | Event::SubagentUpdated { .. }
-                    | Event::SubagentFinished { .. } => {}
+                    | Event::SubagentFinished { .. }
+                    | Event::BackgroundJobFinished { .. } => {}
                     Event::ThinkingComplete {
                         thinking,
                         signature,
@@ -741,7 +764,8 @@ impl Agent {
                     continue;
                 }
                 if !last_iteration
-                    && apply_queued_messages(queue, &mut messages, checkpoint, progress).await
+                    && (apply_queued_messages(queue, &mut messages, checkpoint, progress).await
+                        || deliver_background(&self.tools, &mut messages, progress))
                 {
                     continue;
                 }
@@ -1204,18 +1228,6 @@ impl Agent {
                         (_, Err(error)) => Err(error),
                         _ => Err("interactive question interface unavailable".into()),
                     }
-                } else if let ("BashOutput", Some(queue)) = (name.as_str(), queue) {
-                    let mut wait = Box::pin(self.tools.execute(name, input));
-                    loop {
-                        if queue.has_steering() {
-                            break Ok("Ожидание приостановлено из-за нового сообщения; фоновое задание не было остановлено. Повторите BashOutput, чтобы узнать его состояние и получить результат.".to_string());
-                        }
-                        tokio::select! {
-                            biased;
-                            result = &mut wait => break result,
-                            _ = queue.changed.notified() => {}
-                        }
-                    }
                 } else if name == "Bash" {
                     if let Some(command) = input.get("command").and_then(|value| value.as_str()) {
                         match self.tools.shell().and_then(|shell| {
@@ -1361,6 +1373,7 @@ impl Agent {
                 ));
             }
             apply_queued_messages(queue, &mut messages, checkpoint, progress).await;
+            deliver_background(&self.tools, &mut messages, progress);
         }
     }
 }
@@ -1518,6 +1531,51 @@ fn record_background_child(
         Err(error) => format!("[Background subagent task failed] {error}"),
     };
     messages.push(Message::text(Role::User, text));
+}
+
+/// Fold finished background commands into the conversation and tell the operator.
+///
+/// This is what removes polling: the result arrives as a normal user-role note, so the
+/// next request already carries it and the model can continue without asking.
+fn deliver_background(
+    tools: &crate::tools::Tools,
+    messages: &mut Vec<Message>,
+    progress: Option<&mpsc::Sender<Event>>,
+) -> bool {
+    let completed = tools.take_completed();
+    if completed.is_empty() {
+        return false;
+    }
+    for job in completed {
+        let status = if job.timed_out {
+            "timed out".to_string()
+        } else if let Some(code) = job.exit_code {
+            format!("exit {code}")
+        } else {
+            "finished".to_string()
+        };
+        let mut note = format!(
+            "[Background task {} finished: {status}]\n$ {}\n{}",
+            job.label, job.command, job.output
+        );
+        if note.len() > 20_000 {
+            note.truncate(20_000);
+            note.push_str("\n[output truncated]");
+        }
+        messages.push(Message::text(Role::User, note));
+        if let Some(progress) = progress {
+            let _ = progress.try_send(Event::BackgroundJobFinished {
+                label: job.label,
+                command: job.command,
+                output: job.output,
+                is_error: job.is_error,
+                exit_code: job.exit_code,
+                timed_out: job.timed_out,
+                duration_ms: job.duration_ms,
+            });
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

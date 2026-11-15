@@ -259,6 +259,27 @@ impl SessionStore {
         append_bytes(&mut file, committed, &bytes)
     }
 
+    /// Append several canonical messages in one durable write.
+    /// Used to checkpoint a running turn so a reopened session shows its latest state.
+    pub fn append_many(&self, id: &str, messages: &[Message]) -> io::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut file = self.open_file(id)?;
+        file.lock()?;
+        let (session, committed) = self.read_session(id, &mut file)?;
+        let mut bytes = Vec::new();
+        let mut updated_at_ms = session.metadata.updated_at_ms;
+        for message in messages {
+            updated_at_ms = now_ms()?.max(updated_at_ms);
+            bytes.extend(encode(Body::Message {
+                message: message.clone(),
+                updated_at_ms,
+            })?);
+        }
+        append_bytes(&mut file, committed, &bytes)
+    }
+
     /// Append title/branch metadata without rewriting committed records.
     pub fn update_metadata(
         &self,

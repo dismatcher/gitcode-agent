@@ -233,6 +233,23 @@ pub enum Event {
         /// Messages in submission order.
         messages: Vec<String>,
     },
+    /// A background shell job finished on its own; its result entered the conversation.
+    BackgroundJobFinished {
+        /// Human-readable job label.
+        label: String,
+        /// Executed command.
+        command: String,
+        /// Captured output.
+        output: String,
+        /// Whether the job failed.
+        is_error: bool,
+        /// Exit code when the job exited normally.
+        exit_code: Option<i32>,
+        /// Whether the job hit its timeout.
+        timed_out: bool,
+        /// Total wall-clock milliseconds.
+        duration_ms: u64,
+    },
     /// Updated request usage.
     Usage {
         /// Provider usage counters.

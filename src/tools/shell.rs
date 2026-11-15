@@ -326,7 +326,7 @@ pub fn permission_decision_for(
             {
                 return Ok(Decision::Deny);
             }
-            if engine.mode != Mode::Bypass
+            if engine.mode() != Mode::Bypass
                 && engine
                     .ask
                     .iter()
@@ -338,7 +338,7 @@ pub fn permission_decision_for(
         }
     };
     let mut whole = engine.clone();
-    if whole.mode != Mode::Bypass {
+    if whole.mode() != Mode::Bypass {
         whole.allow = vec![Rule::parse("Bash(**)")?];
     }
     let mut result = Decision::Allow;
@@ -378,6 +378,21 @@ fn authorize(engine: &Engine, command: &str, shell: &crate::platform::Shell) -> 
         Decision::Ask => Err("permission requires explicit approval".into()),
         Decision::Deny => Err("permission denied by policy".into()),
     }
+}
+
+/// A background job that finished on its own, reported without polling.
+#[derive(Debug, Clone)]
+pub struct CompletedJob {
+    /// Captured output.
+    pub output: String,
+    /// Shell exit status; absent on timeout.
+    pub exit_code: Option<i32>,
+    /// Whether the deadline expired.
+    pub timed_out: bool,
+    /// Worker failure, if any.
+    pub error: Option<String>,
+    /// Wall-clock duration in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 /// Completed command with bounded, lossy UTF-8 merged output; nonzero exits are not errors.
@@ -476,24 +491,64 @@ impl Session {
         self.check(engine, command, timeout)?;
         let capture = Arc::new(Mutex::new(Capture::default()));
         let (cancel, cancelled) = oneshot::channel();
+        let (watch, watch_rx) = tokio::sync::watch::channel(None);
+        let started = std::time::Instant::now();
         let (session, engine, command, shared) = (
             self.clone(),
             engine.clone(),
             command.to_owned(),
             capture.clone(),
         );
+        let task_capture = capture.clone();
+        let task_watch = watch.clone();
         let task = tokio::spawn(async move {
-            tokio::select! {
+            let result = tokio::select! {
                 result = session.run(&engine, &command, timeout, shared) => result,
                 _ = cancelled => Err("shell job cancelled; active session reset".into()),
-            }
+            };
+            let bytes = task_capture
+                .lock()
+                .map(|capture| String::from_utf8_lossy(&capture.bytes).into_owned())
+                .unwrap_or_default();
+            let completed = match &result {
+                Ok(output) => CompletedJob {
+                    output: bytes,
+                    exit_code: output.exit_code,
+                    timed_out: output.timed_out,
+                    error: None,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+                Err(error) => CompletedJob {
+                    output: bytes,
+                    exit_code: None,
+                    timed_out: false,
+                    error: Some(error.clone()),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+            };
+            let _ = task_watch.send(Some(completed));
+            result
         });
         Ok(Job {
             capture,
             cancel: Some(cancel),
             task: Some(task),
             result: None,
+            completed: watch_rx,
+            _notify: watch,
         })
+    }
+
+    /// Start a job and return a receiver that yields its result the moment it ends.
+    pub async fn background_watched(
+        &self,
+        engine: &Engine,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<(Job, tokio::sync::watch::Receiver<Option<CompletedJob>>), String> {
+        let job = self.background(engine, command, timeout).await?;
+        let receiver = job.completed.clone();
+        Ok((job, receiver))
     }
 
     fn check(&self, engine: &Engine, command: &str, timeout: Duration) -> Result<(), String> {
@@ -614,8 +669,35 @@ pub struct Job {
     cancel: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<Result<Output, String>>>,
     result: Option<Result<Output, String>>,
+    /// Fires once when the worker finishes, carrying the captured outcome.
+    completed: tokio::sync::watch::Receiver<Option<CompletedJob>>,
+    _notify: tokio::sync::watch::Sender<Option<CompletedJob>>,
 }
 impl Job {
+    /// Receiver that resolves with the outcome as soon as the job ends.
+    pub fn completion_watch(&self) -> tokio::sync::watch::Receiver<Option<CompletedJob>> {
+        self.completed.clone()
+    }
+    /// Human-readable outcome of a finished job.
+    pub fn describe(completed: &CompletedJob) -> String {
+        if let Some(error) = &completed.error {
+            return format!("failed: {error}");
+        }
+        if completed.timed_out {
+            return "timed out".into();
+        }
+        match completed.exit_code {
+            Some(0) => "exit 0".into(),
+            Some(code) => format!("exit {code}"),
+            None => "finished".into(),
+        }
+    }
+    /// Whether a finished job should be reported as an error.
+    pub fn failed(completed: &CompletedJob) -> bool {
+        completed.error.is_some()
+            || completed.timed_out
+            || completed.exit_code.is_some_and(|code| code != 0)
+    }
     /// Read bytes not returned by earlier polls (lossy UTF-8, possibly split across polls).
     /// Output beyond the per-command cap is discarded rather than buffered indefinitely.
     pub fn poll(&mut self) -> Result<String, String> {

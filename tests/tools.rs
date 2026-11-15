@@ -104,7 +104,7 @@ async fn sensitive_files_are_not_exposed_by_native_reads_or_search() {
             .await
             .is_err());
     }
-    tools.permissions.mode = Mode::Bypass;
+    tools.permissions.set_mode(Mode::Bypass);
     assert!(tools
         .execute("Read", &json!({"path":".env"}))
         .await
@@ -123,7 +123,7 @@ async fn edits_are_guarded_and_connected_to_native_executor() {
         .await
         .unwrap_err()
         .contains("approval"));
-    tools.permissions.mode = Mode::AcceptEdits;
+    tools.permissions.set_mode(Mode::AcceptEdits);
     assert!(tools.execute("Edit", &edit).await.is_err());
     tools
         .execute("Read", &json!({"path":"file.txt"}))
@@ -176,7 +176,7 @@ async fn approved_edit_never_overrides_explicit_deny_or_plan_mode() {
     assert!(tools.execute_approved_tool("Write", &input).await.is_err());
     assert!(!root.join("blocked.txt").exists());
     tools.permissions.deny.clear();
-    tools.permissions.mode = Mode::Plan;
+    tools.permissions.set_mode(Mode::Plan);
     assert!(tools.execute_approved_tool("Write", &input).await.is_err());
     assert!(!root.join("blocked.txt").exists());
     std::fs::remove_dir_all(root).unwrap();

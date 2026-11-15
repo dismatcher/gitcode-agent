@@ -36,7 +36,6 @@ pub const GENERAL_PURPOSE_TOOLS: &[&str] = &[
     "TodoWrite",
     "NotebookEdit",
     "apply_patch",
-    "BashOutput",
     "KillShell",
     "McpCall",
     "WebFetch",

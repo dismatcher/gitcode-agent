@@ -1,21 +1,39 @@
 //! Conservative permission decisions independent of tool execution.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+};
 
 /// Unified interactive permission mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[repr(u8)]
 pub enum Mode {
     /// Ask before mutations and commands.
     #[default]
-    Default,
+    Default = 0,
     /// Automatically approve workspace edits.
-    AcceptEdits,
+    AcceptEdits = 1,
     /// Allow exploration only.
-    Plan,
+    Plan = 2,
     /// Explicitly skip permission prompts.
-    Bypass,
+    Bypass = 3,
+}
+
+impl Mode {
+    fn from_stored(value: u8) -> Self {
+        match value {
+            1 => Self::AcceptEdits,
+            2 => Self::Plan,
+            3 => Self::Bypass,
+            _ => Self::Default,
+        }
+    }
 }
 
 /// Permission engine outcome.
@@ -87,8 +105,6 @@ impl Rule {
 /// Workspace boundary and ordered deny/ask/allow rule lists.
 #[derive(Debug, Clone)]
 pub struct Engine {
-    /// Active permission mode.
-    pub mode: Mode,
     /// Canonical workspace root.
     pub root: PathBuf,
     /// Additional explicitly authorized workspace directories.
@@ -99,13 +115,48 @@ pub struct Engine {
     pub ask: Vec<Rule>,
     /// Explicit allow rules.
     pub allow: Vec<Rule>,
+    /// Active permission mode, shared so a mid-turn switch takes effect immediately.
+    mode: Arc<AtomicU8>,
+}
+
+impl Engine {
+    /// Active permission mode.
+    pub fn mode(&self) -> Mode {
+        Mode::from_stored(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// Switch the active permission mode; visible to every clone sharing this engine.
+    pub fn set_mode(&self, mode: Mode) {
+        self.mode.store(mode as u8, Ordering::Relaxed);
+    }
+
+    /// Detached handle that can change the mode while the agent owns `Tools` mutably.
+    pub fn mode_handle(&self) -> ModeHandle {
+        ModeHandle(self.mode.clone())
+    }
+}
+
+/// A permission-mode switch usable during an active turn.
+#[derive(Debug, Clone)]
+pub struct ModeHandle(Arc<AtomicU8>);
+
+impl ModeHandle {
+    /// Current mode.
+    pub fn mode(&self) -> Mode {
+        Mode::from_stored(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Apply a mode change immediately; running tool calls observe it before deciding.
+    pub fn set_mode(&self, mode: Mode) {
+        self.0.store(mode as u8, Ordering::Relaxed);
+    }
 }
 
 impl Engine {
     /// Initialize a workspace boundary using an existing directory.
     pub fn new(root: &Path, mode: Mode) -> Result<Self, String> {
         Ok(Self {
-            mode,
+            mode: Arc::new(AtomicU8::new(mode as u8)),
             root: root
                 .canonicalize()
                 .map_err(|_| "cannot resolve workspace")?,
@@ -153,10 +204,11 @@ impl Engine {
         if self.deny.iter().any(|r| r.matches(tool, resource)) {
             return Decision::Deny;
         }
-        if self.mode == Mode::Plan && mutating {
+        let mode = self.mode();
+        if mode == Mode::Plan && mutating {
             return Decision::Deny;
         }
-        if self.mode == Mode::Bypass {
+        if mode == Mode::Bypass {
             return Decision::Allow;
         }
         if self.ask.iter().any(|r| r.matches(tool, resource)) {
@@ -166,7 +218,7 @@ impl Engine {
             return Decision::Allow;
         }
         if !mutating
-            || self.mode == Mode::AcceptEdits
+            || mode == Mode::AcceptEdits
                 && matches!(
                     tool,
                     "Write" | "Edit" | "MultiEdit" | "apply_patch" | "NotebookEdit"
@@ -230,9 +282,19 @@ mod tests {
         let mut e = Engine::new(Path::new("."), Mode::Plan).unwrap();
         e.allow.push(Rule::parse("Edit(**)").unwrap());
         assert_eq!(e.decide("Edit", "src/a.rs", true), Decision::Deny);
-        e.mode = Mode::Bypass;
+        e.set_mode(Mode::Bypass);
         e.deny.push(Rule::parse("Read(**/secret)").unwrap());
         assert_eq!(e.decide("Read", "a/secret", false), Decision::Deny);
+    }
+    #[test]
+    fn mode_switch_reaches_existing_clones_mid_turn() {
+        let engine = Engine::new(Path::new("."), Mode::Default).unwrap();
+        let handle = engine.mode_handle();
+        let clone = engine.clone();
+        assert_eq!(clone.decide("Write", "src/a", true), Decision::Ask);
+        // The TUI holds only this handle while a turn borrows the agent.
+        handle.set_mode(Mode::Bypass);
+        assert_eq!(clone.decide("Write", "src/a", true), Decision::Allow);
     }
     #[test]
     fn default_asks_before_mutations() {

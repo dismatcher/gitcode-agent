@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use tokio::sync::mpsc;
 
+/// Recent tool results kept verbatim; older ones are trimmed before each request.
+const RETAINED_TOOL_RESULTS: usize = 8;
+/// Maximum bytes kept from each older tool result.
+const TOOL_RESULT_BUDGET: usize = 4_000;
+
 /// Automatic context management; the original session is never modified.
 pub struct Compaction {
     /// Approximate model context window in tokens.
@@ -154,14 +159,28 @@ impl Compaction {
 
     /// Estimate the current model-facing history, including an existing valid summary.
     pub fn estimate_projection(&self, messages: &[Message]) -> Result<u64, String> {
-        if let Some(cache) = &self.cached {
-            if cache.boundary <= messages.len()
-                && Self::digest(&messages[..cache.boundary])? == cache.digest
-            {
-                return estimate(&Self::project(messages, cache));
-            }
-        }
-        estimate(messages)
+        estimate(&self.projection(messages)?)
+    }
+
+    /// Messages actually sent to the provider: compacted prefix plus a tail whose old
+    /// tool output is trimmed. Full history stays available in the session and in
+    /// `Outcome.messages`; only the request shrinks, so input tokens grow slower.
+    pub fn projection(&self, messages: &[Message]) -> Result<Vec<Message>, String> {
+        let mut projected = self.cached.as_ref().map_or_else(
+            || messages.to_vec(),
+            |cache| {
+                if cache.boundary <= messages.len()
+                    && Self::digest(&messages[..cache.boundary]).ok() == Some(cache.digest)
+                {
+                    Self::project(messages, cache)
+                } else {
+                    messages.to_vec()
+                }
+            },
+        );
+        // Keep the latest exchanges intact; older results are what inflate every request.
+        trim_tool_results(&mut projected, RETAINED_TOOL_RESULTS, TOOL_RESULT_BUDGET);
+        Ok(projected)
     }
 
     /// Return a compact model-facing projection, preserving the complete history.
@@ -217,10 +236,7 @@ impl Compaction {
         }) {
             self.cached = None;
         }
-        let projected = self
-            .cached
-            .as_ref()
-            .map_or_else(|| messages.clone(), |cache| Self::project(messages, cache));
+        let projected = self.projection(messages)?;
         let estimated = estimate(&projected)?
             .saturating_add((request.system.len() as u64).div_ceil(3))
             .saturating_add(

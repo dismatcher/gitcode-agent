@@ -68,7 +68,7 @@ The A1.3 resume routine was exercised again: read external state and development
 - M4: terminal foundation verified by 8 terminal tests (guard drop/panic/signal cleanup with injected backend, header snapshots, deterministic intro, Unicode/paste/history editor, native scrollback). Interactive entry point shares the agent with print mode.
 - M5: end-to-end agent, permission engine, native Read/LS/Glob/Grep, and streaming incremental Markdown renderer (`10/10` tests in `tests/markdown.rs`) verified.
 - M6: workspace editing (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `apply_patch` — `23/23` tests), bounded line diff renderer (`2/2` tests), and isolated shadow-git checkpoint store (`12/12` tests) verified.
-- M7: persistent non-interactive Bash session, background jobs (`BashOutput`, `KillShell`), and conservative quote-aware command splitter (`8/8` tests in `tests/shell.rs`) verified and wired into `Tools`.
+- M7: persistent non-interactive Bash session, background jobs with automatic result delivery (`KillShell`), and conservative quote-aware command splitter (`8/8` tests in `tests/shell.rs`) verified and wired into `Tools`.
 - M8: append-only JSONL session store with interrupted-tail recovery, forking, private Unix modes (`0600`/`0700`), hierarchical `GITCODE.md`/`CLAUDE.md`/`AGENTS.md` loader with confined `@import` expansion (`11/11` tests in `tests/sessions.rs`), and context estimation/tool-result trimming verified.
 - M9–M14: intermediate scope closed under the speed-first policy; see tested integrations and Known gaps below.
 - M15: reproducible release/process measurements recorded; full PTY/soak budgets deferred.

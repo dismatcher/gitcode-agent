@@ -2,6 +2,19 @@
 
 All notable changes are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-16
+
+### Changed
+
+- Permission mode switches now take effect immediately, including in the middle of a running turn. The engine keeps the mode in shared state, so a turn that started in `default` or `plan` stops asking for approval as soon as `bypass` is confirmed instead of waiting for the turn to finish.
+- Background commands report their result by themselves. `BashOutput` is gone: a command that outlives `yield_time_ms` becomes a named task (`cargo-build-1`, `npm-test-2`) and its output is appended to the conversation as soon as it exits, both during a turn and while the session idles, so the model continues instead of polling. `KillShell` accepts the label.
+- The session journal is updated while a turn is running: the operator prompt is written before the model runs and completed steps are flushed as tools finish. Reopening a chat after a dropped connection shows the current history immediately.
+- `/resume` starts a clean transcript instead of appending under the previous one.
+
+### Fixed
+
+- Context grows much slower. Requests now send a trimmed projection where older tool results keep only a bounded prefix, and compaction occupancy is measured the same way the status bar measures it. Full history remains in the session and in `/transcript`.
+
 ## [0.3.3] - 2026-11-15
 
 ### Added

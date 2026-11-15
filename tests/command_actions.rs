@@ -115,12 +115,12 @@ async fn command_actions_are_honest_permission_checked_and_isolated() {
     assert!(status.toast.is_none());
 
     for mode in [Mode::Default, Mode::Plan] {
-        agent.tools.permissions.mode = mode;
+        agent.tools.permissions.set_mode(mode);
         let init = run("/init", &mut agent, &mut messages, &mut status).await;
         assert!(init.contains("не создан"));
         assert!(!workspace.join("GITCODE.md").exists());
     }
-    agent.tools.permissions.mode = Mode::Bypass;
+    agent.tools.permissions.set_mode(Mode::Bypass);
     agent
         .tools
         .permissions
@@ -131,7 +131,7 @@ async fn command_actions_are_honest_permission_checked_and_isolated() {
         .contains("не создан"));
     assert!(!workspace.join("GITCODE.md").exists());
     agent.tools.permissions.deny.clear();
-    agent.tools.permissions.mode = Mode::AcceptEdits;
+    agent.tools.permissions.set_mode(Mode::AcceptEdits);
     assert!(run("/init", &mut agent, &mut messages, &mut status)
         .await
         .contains("Создан шаблон"));

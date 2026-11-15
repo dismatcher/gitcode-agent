@@ -217,17 +217,17 @@ fn missing_after_read_is_external_deletion() {
 #[test]
 fn mutation_permissions_use_real_tool_and_mutating_flag() {
     let mut w = Workspace::new();
-    w.permissions.mode = Mode::Default;
+    w.permissions.set_mode(Mode::Default);
     assert!(w
         .run("Write", json!({"path":"a","content":"x"}))
         .unwrap_err()
         .contains("approval"));
-    w.permissions.mode = Mode::Plan;
+    w.permissions.set_mode(Mode::Plan);
     assert!(w
         .patch("*** Begin Patch\n*** Add File: a\n+x\n*** End Patch")
         .unwrap_err()
         .contains("denied"));
-    w.permissions.mode = Mode::AcceptEdits;
+    w.permissions.set_mode(Mode::AcceptEdits);
     w.permissions
         .deny
         .push(Rule::parse("Write(secret)").unwrap());

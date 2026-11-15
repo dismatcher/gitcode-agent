@@ -80,7 +80,7 @@ pub fn completed(
                     plural(lines.len(), one, many)
                 ));
             }
-            "Bash" | "BashOutput" => {
+            "Bash" => {
                 for line in lines {
                     if let Some(code) = line
                         .strip_prefix("[exit code: ")
@@ -281,7 +281,7 @@ fn invocation(name: &str, input: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(" · ")
         }
-        "BashOutput" | "KillShell" => value(input, &["job_id"]),
+        "KillShell" => value(input, &["job_id"]),
         "Glob" => value(input, &["pattern"]),
         "Grep" => {
             let pattern = value(input, &["pattern"]);

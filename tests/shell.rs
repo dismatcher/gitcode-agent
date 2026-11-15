@@ -159,9 +159,9 @@ async fn permissions_fail_closed_before_any_side_effect() {
         .await
         .unwrap_err()
         .contains("approval"));
-    f.engine.mode = Mode::Plan;
+    f.engine.set_mode(Mode::Plan);
     assert!(f.session.execute(&f.engine, "pwd", LIMIT).await.is_err());
-    f.engine.mode = Mode::Bypass;
+    f.engine.set_mode(Mode::Bypass);
     f.engine.deny.push(Rule::parse("Bash(touch *)").unwrap());
     assert!(f
         .session
@@ -204,7 +204,7 @@ async fn ordinary_bash_syntax_works_and_complex_rules_fail_closed() {
         .is_err());
     assert!(!f.root.join("blocked").exists());
     f.engine.deny.clear();
-    f.engine.mode = Mode::Default;
+    f.engine.set_mode(Mode::Default);
     assert!(f
         .session
         .execute(&f.engine, "echo $(printf test)", LIMIT)
@@ -420,21 +420,29 @@ async fn foreground_future_drop_and_independent_sessions() {
 }
 
 #[tokio::test]
-async fn background_wait_reports_failure_without_consuming_output() {
+async fn background_result_arrives_without_polling() {
     let f = Fixture::new(Mode::Bypass);
     let mut tools = gitcode::tools::Tools::new(f.engine.clone());
     let started = tools.execute("Bash", &serde_json::json!({"command":"printf job-output; sh -c 'exit 7'", "run_in_background":true})).await.unwrap();
-    let id = started.split_whitespace().last().unwrap();
-    let output = tools
-        .execute(
-            "BashOutput",
-            &serde_json::json!({"job_id":id, "wait_ms":5000}),
-        )
-        .await
-        .unwrap();
-    assert!(output.contains("finished=true"), "{output}");
-    assert!(output.contains("exit_code=7"), "{output}");
-    assert!(output.contains("job-output"), "{output}");
+    assert!(started.contains("background command"), "{started}");
+    let mut collected = Vec::new();
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        collected = tools.take_completed();
+        if !collected.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(collected.len(), 1);
+    let job = &collected[0];
+    assert_eq!(job.exit_code, Some(7));
+    assert!(job.is_error);
+    assert!(job.output.contains("job-output"), "{}", job.output);
+    assert!(
+        !job.label.is_empty() && !job.label.starts_with("job-"),
+        "{}",
+        job.label
+    );
     tools.shutdown().await.unwrap();
 }
 
@@ -443,19 +451,20 @@ async fn long_foreground_command_yields_and_preserves_shell_session() {
     let f = Fixture::new(Mode::Bypass);
     let mut tools = gitcode::tools::Tools::new(f.engine.clone());
     let start = tools.execute("Bash", &serde_json::json!({"command":"export GITCODE_YIELD_TEST=works; printf early; sleep 0.2; printf late", "yield_time_ms":20})).await.unwrap();
-    assert!(start.contains("background shell job job-1"), "{start}");
-    let output = tools
-        .execute(
-            "BashOutput",
-            &serde_json::json!({"job_id":"job-1", "wait_ms":5000}),
-        )
-        .await
-        .unwrap();
+    assert!(start.contains("background task"), "{start}");
+    let mut collected = Vec::new();
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        collected = tools.take_completed();
+        if !collected.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(collected.len(), 1);
     assert!(
-        output.contains("finished=true")
-            && output.contains("exit_code=0")
-            && output.contains("late"),
-        "{output}"
+        collected[0].exit_code == Some(0) && collected[0].output.contains("late"),
+        "{}",
+        collected[0].output
     );
     let env = tools
         .execute(

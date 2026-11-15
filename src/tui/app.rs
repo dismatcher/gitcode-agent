@@ -967,7 +967,7 @@ async fn handle_aux_action(
     let width = renderer.size().0.saturating_sub(1).max(20);
     match act {
         Action::CyclePermission => {
-            if commands::next_permission_mode(agent.tools.permissions.mode)
+            if commands::next_permission_mode(agent.tools.permissions.mode())
                 == crate::perm::Mode::Bypass
             {
                 status.bypass_confirmation = true;
@@ -1145,7 +1145,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     {
                         status.bypass_confirmation = false;
                         if confirmed {
-                            agent.tools.permissions.mode = crate::perm::Mode::Bypass;
+                            agent.tools.permissions.set_mode(crate::perm::Mode::Bypass);
                             status.permission =
                                 commands::permission_label(crate::perm::Mode::Bypass).into();
                             status.toast = None;
@@ -1164,6 +1164,32 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                 Action::Refresh
             }
         };
+        // A background task may finish while the session is idle. Report it in the
+        // transcript and hand it to the model so work continues without polling.
+        for job in agent.tools.take_completed() {
+            let status_text = if job.timed_out {
+                "timed out".to_string()
+            } else {
+                job.exit_code
+                    .map_or_else(|| "finished".to_string(), |code| format!("exit {code}"))
+            };
+            let rows = completed_tool_rows(
+                "Bash",
+                &format!("{status_text}\n{}", job.output),
+                job.is_error,
+                job.duration_ms,
+                renderer.size().0,
+                &Theme::default(),
+                mode,
+            );
+            renderer.finalize_styled(&rows)?;
+            let note = format!(
+                "[Фоновая задача {} завершилась: {status_text}]\n$ {}\n{}",
+                job.label, job.command, job.output
+            );
+            queue.push_with_image(note, None);
+            status.queued = queue.len();
+        }
         match pending {
             Action::PasteImage => {
                 stage_clipboard_image(&mut editor, &mut status).await;
@@ -1507,6 +1533,10 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                 if interrupted {
                                     body.push("Незавершённый хвост журнала пропущен.".into());
                                 }
+                                // Start a clean transcript: the opened chat must look like the
+                                // operator never left it instead of appending under another one.
+                                renderer.clear_terminal()?;
+                                draw_header(&mut renderer, &header, &status, mode)?;
                                 renderer.finalize_card(&super::widgets::card(
                                     "/resume",
                                     &body,
@@ -1745,6 +1775,20 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     user_message.content.push(image);
                 }
                 request.push(user_message);
+                // Persist the operator prompt before the model runs: a reopened session must
+                // show the request even if the process dies mid-turn.
+                let mut persisted = messages.len();
+                if let Some((store, session)) = &persistence {
+                    let store = store.clone();
+                    let id = session.id.clone();
+                    let pending = request[persisted..].to_vec();
+                    if matches!(
+                        tokio::task::spawn_blocking(move || store.append_many(&id, &pending)).await,
+                        Ok(Ok(()))
+                    ) {
+                        persisted = request.len();
+                    }
+                }
                 super::statusbar::update_context(&mut status, agent, &request);
                 let (sender, mut progress) = mpsc::channel(256);
                 let (approval_sender, mut approvals) = mpsc::channel(1);
@@ -1763,8 +1807,9 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                 let mut live_usage = LiveUsage::default();
                 let mut live_context = LiveContext::default();
                 let mut retry_deadline: Option<(Instant, u32, u32)> = None;
+                // A live handle lets the operator change the mode while the agent owns Tools.
+                let permission_handle = agent.tools.permissions.mode_handle();
                 let mut pending_permission = None;
-                let permission_mode = agent.tools.permissions.mode;
                 let ledger_model = agent.model.clone();
                 let mut frames = frame_clock();
                 let checkpoint = crate::agent::TurnCheckpoint::new(request.clone());
@@ -1797,7 +1842,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     if let Some((store, session)) = &persistence {
                                         let store = store.clone();
                                         let id = session.id.clone();
-                                        let appended = outcome.messages[messages.len()..].to_vec();
+                                        let appended = outcome.messages[persisted.min(outcome.messages.len())..].to_vec();
                                         let requests = outcome.request_usage.clone();
                                         let home = crate::platform::home_dir().ok_or_else(|| io::Error::other("home directory is required"))?;
                                         let project = session.project.clone();
@@ -1805,9 +1850,10 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                         let model = ledger_model.clone();
                                         tokio::task::spawn_blocking(move || {
                                             crate::usage::record_turn(&home, &id, &project, &provider, &model, &requests)?;
-                                            for message in appended { store.append(&id, &message)?; }
+                                            store.append_many(&id, &appended)?;
                                             Ok::<_, io::Error>(())
                                         }).await.map_err(io::Error::other)??;
+                                        persisted = outcome.messages.len();
                                     }
                                     messages = outcome.messages;
                                     let final_text = if response_chunk.is_empty()
@@ -1925,6 +1971,22 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     let rows = completed_tool_rows(&name, &output, is_error, duration_ms, renderer.size().0, &Theme::default(), mode);
                                     renderer.finalize_styled(&rows)?;
                                     status.toast = None;
+                                    // Completed steps reach the journal mid-turn so a reopened
+                                    // session already shows them; the streaming tail stays in memory.
+                                    let snapshot = checkpoint.stable();
+                                    if let Some((store, session)) = &persistence {
+                                        if snapshot.len() > persisted {
+                                            let store = store.clone();
+                                            let id = session.id.clone();
+                                            let pending = snapshot[persisted..].to_vec();
+                                            if matches!(
+                                                tokio::task::spawn_blocking(move || store.append_many(&id, &pending)).await,
+                                                Ok(Ok(()))
+                                            ) {
+                                                persisted = snapshot.len();
+                                            }
+                                        }
+                                    }
                                 }
                                 Some(Progress::SubagentStarted { id, name, task }) => {
                                     status.subagents.push(crate::agent::agency::SubagentRun {
@@ -1961,6 +2023,27 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     }
                                     status.queued = queue.len();
                                     queue.acknowledge();
+                                }
+                                Some(Progress::BackgroundJobFinished { label, output, is_error, duration_ms, .. }) => {
+                                    if !response_chunk.trim().is_empty() {
+                                        renderer.finalize_styled(&format_assistant_turn(
+                                            &mut stream, stream_started, renderer.size().0, &Theme::default(), mode,
+                                        ))?;
+                                        response_chunk.clear();
+                                        stream = super::markdown::Markdown::new();
+                                        stream_started = false;
+                                        committed_response_text = true;
+                                    }
+                                    let rows = completed_tool_rows(
+                                        "Bash",
+                                        &format!("{label} finished\n{output}"),
+                                        is_error,
+                                        duration_ms,
+                                        renderer.size().0,
+                                        &Theme::default(),
+                                        mode,
+                                    );
+                                    renderer.finalize_styled(&rows)?;
                                 }
                                 Some(Progress::Usage { usage }) => {
                                     live_usage.snapshot(usage);
@@ -2019,7 +2102,10 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                 if let Some(confirmed) = super::bypass_picker::answer(&event, &mut status.bypass_selected_yes) {
                                     status.bypass_confirmation = false;
                                     if confirmed {
+                                        // Apply at once: tools that have not run yet must
+                                        // skip their prompts instead of waiting for turn end.
                                         pending_permission = Some(crate::perm::Mode::Bypass);
+                                        permission_handle.set_mode(crate::perm::Mode::Bypass);
                                         status.permission = commands::permission_label(crate::perm::Mode::Bypass).into();
                                         status.toast = None;
                                     }
@@ -2081,14 +2167,13 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     renderer.finalize_card(&commands::history_card(editor.history(), editor.text(), w))?;
                                 }
                                 Action::CyclePermission => {
-                                    let current = pending_permission
-                                        .unwrap_or(permission_mode);
-                                    let next = commands::next_permission_mode(current);
+                                    let next = commands::next_permission_mode(permission_handle.mode());
                                     if next == crate::perm::Mode::Bypass {
                                         status.bypass_confirmation = true;
                                         status.bypass_selected_yes = false;
                                     } else {
                                         pending_permission = Some(next);
+                                        permission_handle.set_mode(next);
                                         status.permission = commands::permission_label(next).into();
                                         status.toast = None;
                                     }
@@ -2129,15 +2214,10 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     if let Some((store, session)) = &persistence {
                         let store = store.clone();
                         let id = session.id.clone();
-                        let appended = recovered[messages.len()..].to_vec();
-                        tokio::task::spawn_blocking(move || {
-                            for message in appended {
-                                store.append(&id, &message)?;
-                            }
-                            Ok::<_, io::Error>(())
-                        })
-                        .await
-                        .map_err(io::Error::other)??;
+                        let appended = recovered[persisted.min(recovered.len())..].to_vec();
+                        tokio::task::spawn_blocking(move || store.append_many(&id, &appended))
+                            .await
+                            .map_err(io::Error::other)??;
                     }
                     messages = recovered;
                 }
@@ -2151,7 +2231,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     );
                 }
                 if let Some(permission) = pending_permission {
-                    agent.tools.permissions.mode = permission;
+                    agent.tools.permissions.set_mode(permission);
                 }
             }
             other @ (Action::Rewind
