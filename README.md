@@ -8,7 +8,6 @@
 
 <p align="center">
   <a href="https://github.com/jaddd14/gitcode-agent/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/jaddd14/gitcode-agent?style=flat-square&labelColor=29232b"></a>
-  <a href="https://github.com/jaddd14/gitcode-agent/deployments"><img alt="Deployments: dev" src="https://img.shields.io/badge/deployments-dev-brightgreen?style=flat-square&labelColor=29232b"></a>
   <a href="https://github.com/jaddd14/gitcode-agent/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/jaddd14/gitcode-agent/ci.yml?branch=main&style=flat-square&label=CI&labelColor=29232b"></a>
   <a href="https://github.com/jaddd14/gitcode-agent/actions/workflows/deploy.yml"><img alt="Deploy" src="https://img.shields.io/github/actions/workflow/status/jaddd14/gitcode-agent/deploy.yml?branch=main&style=flat-square&label=deploy&labelColor=29232b"></a>
   <a href="rust-toolchain.toml"><img alt="Rust 1.99+" src="https://img.shields.io/badge/Rust-1.99%2B-c87591?style=flat-square&logo=rust&logoColor=white&labelColor=29232b"></a>

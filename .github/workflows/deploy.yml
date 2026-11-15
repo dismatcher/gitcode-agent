@@ -48,6 +48,33 @@ jobs:
           name: staging-linux-x86_64
           path: gitcode-staging-linux-x86_64.tar.gz
           if-no-files-found: error
+  dev:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    needs: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: dev
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Record the dev candidate
+        env:
+          REF_NAME: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          git rev-parse --verify "$SHA"
+          {
+            echo "### dev"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Ref | \`$REF_NAME\` |"
+            echo "| Commit | \`$SHA\` |"
+            echo "| Verified by | staging smoke tests on this commit |"
+          } >> "$GITHUB_STEP_SUMMARY"
   verify-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: staging
