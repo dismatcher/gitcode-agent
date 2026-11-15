@@ -517,7 +517,7 @@ async fn yielded_command_does_not_block_next_command_or_share_shell_state() {
         ),
     )
     .await
-    .expect("a yielded command must not block the next shell")
+    .unwrap()
     .unwrap();
     assert!(env.contains("[exit code: 1]"), "{env}");
     let mut collected = Vec::new();
