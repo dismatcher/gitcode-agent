@@ -376,8 +376,7 @@ pub fn style_frame_row_with_panel(
     // The status line is laid out as plain text first so ANSI escapes never
     // affect clipping or cursor positions. Color only its filled context cells.
     let context_filled = row.find("ctx ").and_then(|start| {
-        let after_label = start + "ctx ".len();
-        let bar = row[after_label..].find(' ')? + after_label + 1;
+        let bar = start + "ctx ".len();
         let len = row[bar..]
             .chars()
             .take_while(|ch| matches!(ch, '▮' | '#'))
@@ -675,9 +674,9 @@ mod tests {
     fn context_filled_cells_are_green_and_plain_mode_preserves_text() {
         let theme = Theme::default();
         for row in [
-            "ctx 30% ▮▮▮▯▯▯▯▯▯▯ │ main",
-            "ctx 30% ###------- │ main",
-            "12 ток/с │ 1 в фоне │ ctx 30% ▮▮▮▯▯▯▯▯▯▯ │ main",
+            "ctx ▮▮▮▯▯▯▯▯▯▯ │ main",
+            "ctx ###------- │ main",
+            "12 ток/с │ 1 в фоне │ ctx ▮▮▮▯▯▯▯▯▯▯ │ main",
         ] {
             for mode in [
                 ColorMode::TrueColor,

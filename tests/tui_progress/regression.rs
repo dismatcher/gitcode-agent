@@ -1,6 +1,6 @@
 //! Regression checks exercise the same private clock and accounting as the UI.
 
-use super::{frame_clock, LiveUsage};
+use super::{frame_clock, LiveContext, LiveUsage};
 use crate::{provider::canonical::Usage, tui::statusbar::Status};
 use std::time::Duration;
 
@@ -30,6 +30,23 @@ async fn continuous_events_do_not_restart_frame_deadlines() {
         frames.missed_tick_behavior(),
         tokio::time::MissedTickBehavior::Skip
     );
+}
+
+#[test]
+fn context_grows_while_streaming_and_resets_to_compacted_projection() {
+    let mut status = Status::default();
+    let mut live = LiveContext::default();
+    live.add_bytes(300, &mut status);
+    assert!(status.context_percent.is_none());
+    live.reset(100, 1_000, &mut status);
+    assert_eq!(status.context_percent, Some(10.0));
+    live.add_bytes(150, &mut status);
+    live.add_bytes(150, &mut status);
+    assert_eq!(status.context_percent, Some(20.0));
+    live.reset(50, 1_000, &mut status);
+    assert_eq!(status.context_percent, Some(5.0));
+    live.add_bytes(9_000, &mut status);
+    assert_eq!(status.context_percent, Some(100.0));
 }
 
 #[test]

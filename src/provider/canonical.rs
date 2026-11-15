@@ -168,6 +168,13 @@ pub enum Event {
         /// Scheduled backoff in milliseconds.
         delay_ms: u64,
     },
+    /// Estimated size of the model-facing request after context compaction.
+    ContextUsage {
+        /// Estimated tokens currently in the prompt, excluding reserved output.
+        used_tokens: u64,
+        /// Configured model context window.
+        window_tokens: u64,
+    },
     /// The agent is summarizing older conversation context.
     CompactionStarted,
     /// Context summarization finished successfully.

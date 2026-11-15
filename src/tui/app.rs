@@ -134,6 +134,36 @@ impl LiveUsage {
     }
 }
 
+/// Estimate the current request plus streamed content until the next projection.
+#[derive(Default)]
+struct LiveContext {
+    base_tokens: Option<u64>,
+    window_tokens: u64,
+    added_bytes: u64,
+}
+
+impl LiveContext {
+    fn reset(&mut self, used_tokens: u64, window_tokens: u64, status: &mut Status) {
+        self.base_tokens = Some(used_tokens);
+        self.window_tokens = window_tokens.max(1);
+        self.added_bytes = 0;
+        self.apply(status);
+    }
+
+    fn add_bytes(&mut self, bytes: usize, status: &mut Status) {
+        self.added_bytes = self.added_bytes.saturating_add(bytes as u64);
+        self.apply(status);
+    }
+
+    fn apply(&self, status: &mut Status) {
+        if let Some(base) = self.base_tokens {
+            let used = base.saturating_add(self.added_bytes.div_ceil(3));
+            status.context_percent =
+                Some((used as f64 / self.window_tokens.max(1) as f64).clamp(0.0, 1.0) * 100.0);
+        }
+    }
+}
+
 fn completion_line(
     unix_seconds: u64,
     elapsed: Duration,
@@ -1731,6 +1761,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                 let base = status.clone();
                 start_turn_status(&mut status);
                 let mut live_usage = LiveUsage::default();
+                let mut live_context = LiveContext::default();
                 let mut retry_deadline: Option<(Instant, u32, u32)> = None;
                 let mut pending_permission = None;
                 let permission_mode = agent.tools.permissions.mode;
@@ -1838,6 +1869,9 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                             status.elapsed_secs = started.elapsed().as_secs();
                             status.elapsed_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                             match event {
+                                Some(Progress::ContextUsage { used_tokens, window_tokens }) => {
+                                    live_context.reset(used_tokens, window_tokens, &mut status);
+                                }
                                 Some(Progress::CompactionStarted) => status.compacting = true,
                                 Some(Progress::CompactionFinished) => status.compacting = false,
                                 Some(Progress::TextDelta { text }) => {
@@ -1845,10 +1879,12 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     status.retry_notice = None;
                                     response_chunk.push_str(&text);
                                     stream.push(&text);
+                                    live_context.add_bytes(text.len(), &mut status);
                                     live_usage.add_text(&text);
                                     live_usage.apply(&mut status, &base, started.elapsed());
                                 }
                                 Some(Progress::ThinkingDelta { text }) => {
+                                    live_context.add_bytes(text.len(), &mut status);
                                     live_usage.add_text(&text);
                                     live_usage.apply(&mut status, &base, started.elapsed());
                                 }
@@ -1856,6 +1892,8 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     retry_deadline = Some((Instant::now() + Duration::from_millis(delay_ms), attempt, max_attempts));
                                 }
                                 Some(Progress::ToolStarted { name, input, .. }) => {
+                                    let bytes = serde_json::to_vec(&input).map_or(0, |data| data.len()).saturating_add(name.len());
+                                    live_context.add_bytes(bytes, &mut status);
                                     running_tools = running_tools.saturating_add(1);
                                     status.tools_used = status.tools_used.saturating_add(1);
                                     retry_deadline = None;
@@ -1882,6 +1920,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     renderer.finalize_styled(&style_tool_rows(&rows, true, false, &Theme::default(), mode))?;
                                 }
                                 Some(Progress::ToolFinished { name, output, is_error, duration_ms, .. }) => {
+                                    live_context.add_bytes(output.len(), &mut status);
                                     running_tools = running_tools.saturating_sub(1);
                                     let rows = completed_tool_rows(&name, &output, is_error, duration_ms, renderer.size().0, &Theme::default(), mode);
                                     renderer.finalize_styled(&rows)?;

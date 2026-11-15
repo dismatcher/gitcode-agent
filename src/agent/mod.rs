@@ -534,6 +534,16 @@ impl Agent {
                         .await?
                 };
                 request.messages = projection;
+                if let Some(progress) = progress {
+                    if let Ok(used_tokens) = context::estimate_request_context(&request) {
+                        let _ = progress
+                            .send(Event::ContextUsage {
+                                used_tokens,
+                                window_tokens: self.compaction.window.max(1),
+                            })
+                            .await;
+                    }
+                }
                 for (used, elapsed) in compact_usage {
                     usage.input_tokens += used.input_tokens;
                     usage.output_tokens += used.output_tokens;
@@ -600,6 +610,7 @@ impl Agent {
                     | Event::RetryNotice { .. }
                     | Event::CompactionStarted
                     | Event::CompactionFinished
+                    | Event::ContextUsage { .. }
                     | Event::ToolStarted { .. }
                     | Event::ToolFinished { .. }
                     | Event::SteeringApplied { .. }

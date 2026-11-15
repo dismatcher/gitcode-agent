@@ -194,10 +194,17 @@ async fn tool_lifecycle(with_progress: bool, closed_progress: bool) {
         result
     });
     let mut lifecycle = Vec::new();
+    let mut contexts = Vec::new();
     if with_progress {
         if let Some(rx) = &mut rx {
             while let Some(event) = rx.recv().await {
                 match event {
+                    Event::ContextUsage {
+                        used_tokens,
+                        window_tokens,
+                    } => {
+                        contexts.push((used_tokens, window_tokens));
+                    }
                     Event::ToolStarted { .. } => {
                         if lifecycle.is_empty() {
                             assert!(
@@ -219,6 +226,10 @@ async fn tool_lifecycle(with_progress: bool, closed_progress: bool) {
     assert_eq!(outcome.requests, 2);
     assert!(!root.join("denied.txt").exists());
     if with_progress && !closed_progress {
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].1, 200_000);
+        assert!(contexts[0].0 > 0);
+        assert!(contexts[1].0 > contexts[0].0);
         assert_eq!(lifecycle.len(), 6);
         let results: Vec<_> = outcome
             .messages

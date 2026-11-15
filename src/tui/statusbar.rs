@@ -126,17 +126,13 @@ impl Status {
             .tokens_per_second
             .filter(|n| n.is_finite() && *n >= 0.0)
             .map_or_else(|| "—".into(), |n| format!("{n:.1}"));
-        let context = self
-            .context_percent
-            .filter(|n| n.is_finite())
-            .map_or_else(|| "—".into(), |n| format!("{:.0}%", n.clamp(0.0, 100.0)));
         let cost = self
             .cost_usd
             .filter(|n| n.is_finite() && *n >= 0.0)
             .map_or_else(|| "—".into(), |n| format!("${n:.4}"));
         use unicode_width::UnicodeWidthStr;
         let right = format!(
-            "ctx {context} {} │ {}{}",
+            "ctx {} │ {}{}",
             {
                 let value = self
                     .context_percent
@@ -233,8 +229,14 @@ mod tests {
             ..Status::default()
         };
         let line = status.line(100);
-        assert!(line.contains(&format!("ctx {:.0}%", full.ratio() * 100.0)));
+        assert!(line.contains("ctx "));
+        assert!(!line.contains('%'));
         status.context_percent = Some(200.0);
-        assert!(status.line(100).contains("ctx 100%"));
+        let full_bar = if super::super::widgets::Glyphs::detect().ascii {
+            "ctx ##########"
+        } else {
+            "ctx ▮▮▮▮▮▮▮▮▮▮"
+        };
+        assert!(status.line(100).contains(full_bar));
     }
 }

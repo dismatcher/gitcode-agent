@@ -724,6 +724,18 @@ fn failed_summary(reason: &str, truncated: bool, off_template: bool) -> String {
     format!("не удалось завершить сжатие: {detail}; полная история сохранена")
 }
 
+/// Estimate the complete model-facing input, excluding reserved output tokens.
+pub fn estimate_request_context(request: &Request) -> Result<u64, String> {
+    let system = (request.system.len() as u64).div_ceil(3);
+    let tools = (serde_json::to_vec(&request.tools)
+        .map_err(|_| "cannot estimate tools")?
+        .len() as u64)
+        .div_ceil(3);
+    Ok(system
+        .saturating_add(tools)
+        .saturating_add(estimate(&request.messages)?))
+}
+
 /// Estimate tokens from serialized UTF-8 bytes, rounding up conservatively.
 ///
 /// This is explicitly a heuristic rather than a tokenizer or provider usage.
