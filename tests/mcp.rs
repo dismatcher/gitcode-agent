@@ -379,10 +379,25 @@ async fn stdio_mcp_resources_and_prompts_reject_invalid_server_responses() {
 
 #[tokio::test]
 async fn oversized_mcp_resource_contents_are_truncated() {
-    let filler = "x".repeat(MAX_MCP_OUTPUT_BYTES + 1024);
-    let server = sh_command(stdio_script(&format!(
-        r#"{{"jsonrpc":"2.0","id":2,"result":{{"contents":[{{"uri":"file:///big","text":"{filler}"}}]}}}}"#
-    )));
+    // The filler is produced by the shell, not passed as an argument: Windows
+    // caps a command line at 32767 characters, so a 100 KiB argv would fail to
+    // spawn there instead of testing truncation. printf repeats the literal
+    // without any external utilities, which keeps this portable.
+    let target = MAX_MCP_OUTPUT_BYTES + 1024;
+    let block = "x".repeat(1000);
+    let blocks = target / 1000;
+    let script = format!(
+        concat!(
+            "read line1; read line2; read line3; ",
+            "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}'; ",
+            "printf '%s' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"contents\":[{{\"uri\":\"file:///big\",\"text\":\"'; ",
+            "printf '{block}%.0s' $(seq {blocks}); ",
+            "printf '%s\\n' '\"}}]}}}}'"
+        ),
+        block = block,
+        blocks = blocks
+    );
+    let server = sh_command(script);
     let text = server.read_resource("file:///big").await.unwrap();
     assert!(text.len() <= MAX_MCP_OUTPUT_BYTES + "\n[mcp output truncated]".len());
     assert!(text.ends_with("[mcp output truncated]"));
