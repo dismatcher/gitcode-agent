@@ -247,10 +247,17 @@ fn projects_cannot_enable_plugins_without_user_trust() {
 #[cfg(unix)]
 #[tokio::test]
 async fn executable_loads_enabled_plugin_and_dispatches_its_hook() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let root = dir.path().join("workspace");
+    let alias = tempfile::tempdir().unwrap();
+    // macOS temporary directories commonly pass through /var -> /private/var.
+    // Simulate that on every Unix platform, and pass only resolved paths to
+    // GitCode, whose session storage correctly rejects symlink ancestors.
+    let link = alias.path().join("temp-link");
+    symlink(dir.path(), &link).unwrap();
+    let base = link.canonicalize().unwrap();
+    let home = base.join("home");
+    let root = base.join("workspace");
     let package = home.join(".gitcode/plugins/fixture");
     std::fs::create_dir_all(&package).unwrap();
     std::fs::set_permissions(
