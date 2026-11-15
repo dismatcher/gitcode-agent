@@ -1809,7 +1809,7 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                 let mut retry_deadline: Option<(Instant, u32, u32)> = None;
                 // A live handle lets the operator change the mode while the agent owns Tools.
                 let permission_handle = agent.tools.permissions.mode_handle();
-                let mut pending_permission = None;
+
                 let ledger_model = agent.model.clone();
                 let mut frames = frame_clock();
                 let checkpoint = crate::agent::TurnCheckpoint::new(request.clone());
@@ -2104,7 +2104,6 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                     if confirmed {
                                         // Apply at once: tools that have not run yet must
                                         // skip their prompts instead of waiting for turn end.
-                                        pending_permission = Some(crate::perm::Mode::Bypass);
                                         permission_handle.set_mode(crate::perm::Mode::Bypass);
                                         status.permission = commands::permission_label(crate::perm::Mode::Bypass).into();
                                         status.toast = None;
@@ -2172,7 +2171,6 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                                         status.bypass_confirmation = true;
                                         status.bypass_selected_yes = false;
                                     } else {
-                                        pending_permission = Some(next);
                                         permission_handle.set_mode(next);
                                         status.permission = commands::permission_label(next).into();
                                         status.toast = None;
@@ -2229,9 +2227,6 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
                     status.toast = Some(
                         "Не удалось сохранить сжатый контекст; полная история сохранена".into(),
                     );
-                }
-                if let Some(permission) = pending_permission {
-                    agent.tools.permissions.set_mode(permission);
                 }
             }
             other @ (Action::Rewind
