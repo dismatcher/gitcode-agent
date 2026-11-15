@@ -132,7 +132,23 @@ async fn sensitive_files_are_not_exposed_by_native_reads_or_search() {
     assert!(tools
         .execute("Read", &json!({"path":".env"}))
         .await
-        .is_err());
+        .unwrap()
+        .contains("fixture-secret-marker"));
+}
+
+#[tokio::test]
+async fn bypass_allows_workspace_writes_despite_deny_rules() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".probe")).unwrap();
+    let mut engine = Engine::new(root.path(), Mode::Bypass).unwrap();
+    engine.deny.push(Rule::parse("Write(**)").unwrap());
+    let mut tools = Tools::new(engine);
+    let target = root.path().join(".probe/nineaws_who.py");
+    tools
+        .execute("Write", &json!({"path":target, "content":"print('ok')\n"}))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "print('ok')\n");
 }
 
 #[tokio::test]

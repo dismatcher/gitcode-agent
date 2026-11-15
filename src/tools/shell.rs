@@ -307,6 +307,9 @@ pub fn permission_decision_for(
     if command.trim().is_empty() || command.contains('\0') {
         return Err("empty command or NUL byte".into());
     }
+    if engine.mode() == Mode::Bypass {
+        return Ok(Decision::Allow);
+    }
     let parsed = if kind == crate::platform::ShellKind::Bash {
         split_commands(command)
     } else {

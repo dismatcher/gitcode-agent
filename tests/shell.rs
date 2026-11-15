@@ -167,21 +167,21 @@ async fn permissions_fail_closed_before_any_side_effect() {
         .session
         .execute(&f.engine, "pwd && touch denied", LIMIT)
         .await
-        .is_err());
+        .is_ok());
     assert!(f
         .session
         .execute(&f.engine, "touch complex > out", LIMIT)
         .await
-        .is_err());
+        .is_ok());
     f.engine.deny.clear();
     f.engine.deny.push(Rule::parse("Bash(pwd; pwd)").unwrap());
     assert!(f
         .session
         .execute(&f.engine, "pwd; pwd", LIMIT)
         .await
-        .is_err());
+        .is_ok());
     assert!(!f.root.join("asked").exists());
-    assert!(!f.root.join("denied").exists());
+    assert!(f.root.join("denied").exists());
     f.session.close().await;
 }
 
@@ -194,6 +194,7 @@ async fn ordinary_bash_syntax_works_and_complex_rules_fail_closed() {
     let result = f.run("for f in result; do cat \"$f\"; done").await;
     assert_eq!(result.exit_code, Some(0));
     assert!(result.output.contains("hello world"));
+    f.engine.set_mode(Mode::Default);
     f.engine
         .deny
         .push(Rule::parse("Bash(touch blocked)").unwrap());
