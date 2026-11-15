@@ -2,6 +2,12 @@
 
 All notable changes are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1] - 2026-11-16
+
+### Added
+
+- Startup update banner. When a newer release is published, `gitcode` opens with a picker modelled on Codex: a bold `Update available · current → latest` headline, a dim release-notes link, and three choices — run the verified self-update now, skip this time, or skip until the next version. The published version is cached in `~/.gitcode/version.json` and refreshed in the background every 20 hours, so a slow or unreachable network never delays the first frame and the banner that is shown always comes from a completed lookup. A skipped version stays hidden until something newer appears.
+
 ## [0.4.0] - 2026-11-16
 
 ### Changed

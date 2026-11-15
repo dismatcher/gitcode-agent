@@ -22,6 +22,7 @@ pub mod statusbar;
 pub mod term;
 pub mod theme_picker;
 pub mod tool_card;
+mod update_picker;
 pub mod usage_panel;
 mod viewport;
 pub mod widgets;

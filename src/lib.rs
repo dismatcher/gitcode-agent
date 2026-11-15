@@ -24,5 +24,6 @@ pub mod theme;
 pub mod tools;
 pub mod tui;
 pub mod update;
+pub mod update_check;
 pub mod usage;
 pub mod web_git;

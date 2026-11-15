@@ -241,6 +241,50 @@ fn update_copy_notice(
     Ok(false)
 }
 
+/// Offer an available release before the first frame is drawn.
+///
+/// The cached lookup is read once, so an unreachable network never delays
+/// startup; a stale cache only triggers a background refresh for the next run.
+async fn update_prompt(
+    renderer: &mut Renderer<io::Stdout>,
+    events: &mut EventStream,
+    mode: ColorMode,
+) -> io::Result<Option<(super::update_picker::Choice, String)>> {
+    let Some(home) = crate::platform::home_dir() else {
+        return Ok(None);
+    };
+    let installed = env!("CARGO_PKG_VERSION");
+    let Some(latest) = crate::update_check::banner(&home, installed) else {
+        return Ok(None);
+    };
+    let mut choice = super::update_picker::Choice::UpdateNow;
+    loop {
+        let (width, height) = renderer.size();
+        renderer
+            .paint_styled(&super::update_picker::frame(
+                choice,
+                installed,
+                &latest,
+                width.saturating_sub(1),
+                super::picker::height(height),
+                mode,
+            ))
+            .map_err(io::Error::other)?;
+        match events.next().await {
+            Some(Ok(Event::Key(key))) => {
+                let event = Event::Key(key);
+                if let Some(decision) = super::update_picker::answer(&event, &mut choice) {
+                    return Ok(Some((decision, latest)));
+                }
+            }
+            Some(Ok(Event::Resize(width, height))) => renderer.resize(width.into(), height.into()),
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(error),
+            None => return Ok(None),
+        }
+    }
+}
+
 async fn save_compaction_checkpoint(
     agent: &Agent,
     persistence: &Option<(
@@ -1067,6 +1111,26 @@ pub async fn run(agent: &mut Agent, options: Options<'_>) -> io::Result<()> {
             IntroEnd::Skipped(event) => initial = Some(event),
             IntroEnd::Closed => return Ok(()),
             IntroEnd::Finished => {}
+        }
+    }
+    if let Some((choice, latest)) = update_prompt(&mut renderer, &mut events, mode).await? {
+        match choice {
+            super::update_picker::Choice::UpdateNow => {
+                // Leave the alternate screen before the installer writes output.
+                _guard.restore();
+                let outcome = crate::update::run().await;
+                match outcome {
+                    Ok(()) => println!("Запустите gitcode заново, чтобы обновиться."),
+                    Err(reason) => println!("Не удалось обновиться: {reason}"),
+                }
+                return Ok(());
+            }
+            super::update_picker::Choice::SkipVersion => {
+                if let Some(home) = crate::platform::home_dir() {
+                    crate::update_check::dismiss(&home, &latest);
+                }
+            }
+            super::update_picker::Choice::Later => {}
         }
     }
     let header = Header {
