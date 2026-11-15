@@ -67,7 +67,7 @@ fn signed_thinking_replays_verbatim() {
             }],
         }],
     };
-    let encoded = gitcode::provider::anthropic::encode(&request).unwrap();
+    let encoded = gitcode::provider::anthropic::encode(&request, false).unwrap();
     assert_eq!(
         encoded["messages"][0]["content"][0],
         json!({"type":"thinking","thinking":"original reasoning","signature":"opaque-signature"})

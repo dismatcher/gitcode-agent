@@ -370,6 +370,18 @@ pub async fn execute_command(
                 .compaction
                 .estimate_projection(messages)
                 .map_err(io::Error::other)?;
+            if let Some(context) = crate::extensibility::run_matching_hooks_in(
+                agent.tools.hooks(),
+                crate::extensibility::HookEvent::PreCompact,
+                None,
+                &serde_json::json!({"event":"PreCompact", "estimated_tokens": before, "window": agent.compaction.window, "cwd": agent.tools.permissions.root}),
+                Some(&agent.tools.permissions.root),
+            )
+            .await
+            .additional_context
+            {
+                body.push(format!("Контекст хука: {context}"));
+            }
             let request = crate::provider::canonical::Request {
                 model: agent.model.clone(),
                 system: agent.system.clone(),

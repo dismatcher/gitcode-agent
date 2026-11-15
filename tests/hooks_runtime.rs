@@ -347,3 +347,95 @@ command = "printf '{\"additionalContext\":\"plugin loaded in executable\"}'"
     assert!(String::from_utf8_lossy(&output.stdout).contains("plugin test complete"));
     server.await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_events_dispatch_and_inject_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&buffer[..n]);
+            if bytes.windows(4).any(|value| value == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let response = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"finished\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        )
+        .to_owned();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let rule = |event, command: &str| HookRule {
+        event,
+        matcher: None,
+        command: command.into(),
+        timeout_ms: 3000,
+    };
+    let mut tools = Tools::new(Engine::new(&root, Mode::Bypass).unwrap());
+    // Each hook records its own stdin so the payload contract stays observable.
+    tools.set_hooks(vec![
+        rule(
+            HookEvent::UserPromptSubmit,
+            "cat > prompt.json; printf '{\"additionalContext\":\"prompt context\"}'",
+        ),
+        rule(
+            HookEvent::Stop,
+            "cat > stop.json; printf '{\"additionalContext\":\"stop context\"}'",
+        ),
+    ]);
+    let mut agent = Agent {
+        client: Client::new(
+            &format!("http://{address}"),
+            None,
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap(),
+        tools,
+        model: "mock".into(),
+        system: "test".into(),
+        max_turns: 2,
+        max_tokens: 128,
+        compaction: Compaction::new(200_000, 0.9),
+    };
+    let outcome = agent
+        .run(vec![Message::text(Role::User, "hello lifecycle")], None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.text, "finished");
+    let prompt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("prompt.json")).unwrap()).unwrap();
+    assert_eq!(prompt["event"], "UserPromptSubmit");
+    assert_eq!(prompt["prompt"], "hello lifecycle");
+    let stop: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("stop.json")).unwrap()).unwrap();
+    assert_eq!(stop["event"], "Stop");
+    assert_eq!(stop["text"], "finished");
+    // Stop context must reach the retained conversation for the next turn.
+    let rendered = serde_json::to_string(&outcome.messages).unwrap();
+    assert!(rendered.contains("stop context"));
+    assert!(rendered.contains("prompt context"));
+    server.await.unwrap();
+}

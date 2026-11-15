@@ -15,6 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 /// Maximum output bytes returned from an MCP tool or resource call before truncation.
 pub const MAX_MCP_OUTPUT_BYTES: usize = 100_000;
 
+/// Maximum number of descriptors, contents, or messages parsed from a single MCP list response.
+pub const MAX_MCP_LIST_ITEMS: usize = 256;
+
 /// Transport configuration for a single MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -72,6 +75,59 @@ pub struct McpServerStatus {
     pub connected: bool,
     /// Number of exposed tools.
     pub tool_count: usize,
+}
+
+/// Discovered MCP resource descriptor returned by `resources/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpResourceInfo {
+    /// Resource URI accepted by [`StdioMcpClient::read_resource`] and [`HttpMcpClient::read_resource`].
+    pub uri: String,
+    /// Human-readable resource name.
+    #[serde(default)]
+    pub name: String,
+    /// Human-readable resource description.
+    #[serde(default)]
+    pub description: String,
+    /// Declared MIME type of the resource contents, if the server reports one.
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+/// Argument accepted by an MCP prompt template.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpPromptArgument {
+    /// Argument name.
+    pub name: String,
+    /// Human-readable argument description.
+    #[serde(default)]
+    pub description: String,
+    /// Whether the caller must supply the argument.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Discovered MCP prompt descriptor returned by `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpPromptInfo {
+    /// Prompt name accepted by [`StdioMcpClient::get_prompt`] and [`HttpMcpClient::get_prompt`].
+    pub name: String,
+    /// Human-readable prompt description.
+    #[serde(default)]
+    pub description: String,
+    /// Arguments the server accepts for this prompt.
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// One rendered prompt message returned by `prompts/get`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpPromptMessage {
+    /// Message role reported by the server, for example `user` or `assistant`.
+    #[serde(default)]
+    pub role: String,
+    /// Bounded plain-text rendering of the message content.
+    #[serde(default)]
+    pub text: String,
 }
 
 fn valid_ident(s: &str) -> bool {
@@ -174,6 +230,71 @@ fn bound_output(mut text: String) -> String {
     text
 }
 
+/// Deserialize the `items_field` array of a `*/list` result into bounded descriptors.
+fn parse_list<T>(result: &Value, items_field: &str, what: &str) -> Result<Vec<T>, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let items = result[items_field]
+        .as_array()
+        .ok_or_else(|| format!("invalid MCP {what} list"))?;
+    let bounded = Value::Array(items.iter().take(MAX_MCP_LIST_ITEMS).cloned().collect());
+    serde_json::from_value(bounded).map_err(|_| format!("invalid MCP {what} list"))
+}
+
+/// Parse the `contents` array of a `resources/read` result into bounded text.
+fn parse_resource_contents(result: &Value) -> Result<String, String> {
+    let contents = result["contents"]
+        .as_array()
+        .ok_or_else(|| "invalid MCP resource contents".to_owned())?;
+    if contents.is_empty() {
+        return Err("MCP resource has no contents".into());
+    }
+    let text = contents
+        .iter()
+        .take(MAX_MCP_LIST_ITEMS)
+        .map(|item| match item["text"].as_str() {
+            Some(text) => text.to_owned(),
+            None => match item["blob"].as_str() {
+                Some(_) => "[binary resource content omitted]".to_owned(),
+                None => format!(
+                    "[resource without text or blob: {}]",
+                    bound_output(item.to_string())
+                ),
+            },
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(bound_output(text))
+}
+
+/// Parse the `messages` array of a `prompts/get` result into bounded text messages.
+fn parse_prompt_messages(result: &Value) -> Result<Vec<McpPromptMessage>, String> {
+    let messages = result["messages"]
+        .as_array()
+        .ok_or_else(|| "invalid MCP prompt messages".to_owned())?;
+    let mut parsed = Vec::with_capacity(messages.len().min(MAX_MCP_LIST_ITEMS));
+    for message in messages.iter().take(MAX_MCP_LIST_ITEMS) {
+        let text = match message["content"].as_array() {
+            Some(items) => items
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .map(|text| bound_output(text.to_owned()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => match message["content"]["text"].as_str() {
+                Some(text) => bound_output(text.to_owned()),
+                None => continue,
+            },
+        };
+        parsed.push(McpPromptMessage {
+            role: message["role"].as_str().unwrap_or_default().to_owned(),
+            text,
+        });
+    }
+    Ok(parsed)
+}
+
 /// Stdio JSON-RPC 2.0 MCP client.
 pub struct StdioMcpClient {
     command: String,
@@ -268,6 +389,48 @@ impl StdioMcpClient {
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>, String> {
         let result = self.request("tools/list", json!({})).await?;
         serde_json::from_value(result["tools"].clone()).map_err(|_| "invalid MCP tools list".into())
+    }
+
+    /// List resources exposed by the stdio MCP server.
+    pub async fn list_resources(&self) -> Result<Vec<McpResourceInfo>, String> {
+        let result = self.request("resources/list", json!({})).await?;
+        parse_list(&result, "resources", "resources")
+    }
+
+    /// Read a resource by URI from the stdio MCP server and return bounded text.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let result = self
+            .request("resources/read", json!({ "uri": uri }))
+            .await?;
+        parse_resource_contents(&result)
+    }
+
+    /// List prompt templates exposed by the stdio MCP server.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPromptInfo>, String> {
+        let result = self.request("prompts/list", json!({})).await?;
+        parse_list(&result, "prompts", "prompts")
+    }
+
+    /// Render a prompt template on the stdio MCP server into bounded messages.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Vec<McpPromptMessage>, String> {
+        let arguments = match arguments {
+            Value::Null => json!({}),
+            other => other,
+        };
+        if !arguments.is_object() {
+            return Err("MCP prompt arguments must be a JSON object".into());
+        }
+        let result = self
+            .request(
+                "prompts/get",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        parse_prompt_messages(&result)
     }
 
     /// Invoke a tool on the stdio MCP server and return bounded text.
@@ -400,16 +563,9 @@ impl StdioMcpSession {
         name: &str,
         arguments: Value,
     ) -> Result<String, String> {
-        let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or("MCP request ID exhausted")?;
-        let timeout = self.timeout;
-        let result = tokio::time::timeout(timeout, async {
-            self.send(&json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{"name":name,"arguments":arguments}})).await?;
-            self.receive(id).await
-        }).await.map_err(|_| "MCP stdio request timed out".to_owned())??;
+        let result = self
+            .roundtrip("tools/call", json!({"name": name, "arguments": arguments}))
+            .await?;
         if result["isError"].as_bool() == Some(true) {
             return Err("MCP tool returned an error".into());
         }
@@ -424,6 +580,22 @@ impl StdioMcpSession {
             })
             .unwrap_or_else(|| result.to_string());
         Ok(bound_output(text))
+    }
+
+    async fn roundtrip(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or("MCP request ID exhausted")?;
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async {
+            self.send(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
+                .await?;
+            self.receive(id).await
+        })
+        .await
+        .map_err(|_| "MCP stdio request timed out".to_owned())?
     }
 
     pub(crate) async fn close(mut self) {
@@ -527,6 +699,48 @@ impl HttpMcpClient {
             })
             .unwrap_or_else(|| result.to_string());
         Ok(bound_output(text))
+    }
+
+    /// List resources exposed by the HTTP MCP server.
+    pub async fn list_resources(&self) -> Result<Vec<McpResourceInfo>, String> {
+        let result = self.request("resources/list", json!({})).await?;
+        parse_list(&result, "resources", "resources")
+    }
+
+    /// Read a resource by URI over HTTP/SSE MCP and return bounded text.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let result = self
+            .request("resources/read", json!({ "uri": uri }))
+            .await?;
+        parse_resource_contents(&result)
+    }
+
+    /// List prompt templates exposed by the HTTP MCP server.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPromptInfo>, String> {
+        let result = self.request("prompts/list", json!({})).await?;
+        parse_list(&result, "prompts", "prompts")
+    }
+
+    /// Render a prompt template over HTTP/SSE MCP into bounded messages.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Vec<McpPromptMessage>, String> {
+        let arguments = match arguments {
+            Value::Null => json!({}),
+            other => other,
+        };
+        if !arguments.is_object() {
+            return Err("MCP prompt arguments must be a JSON object".into());
+        }
+        let result = self
+            .request(
+                "prompts/get",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        parse_prompt_messages(&result)
     }
 }
 

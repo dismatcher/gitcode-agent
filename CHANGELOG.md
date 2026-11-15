@@ -2,6 +2,19 @@
 
 All notable changes are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-15
+
+### Added
+
+- `UserPromptSubmit`, `Stop`, `SubagentStop` and `PreCompact` lifecycle hooks now dispatch in interactive and headless sessions, including subagent turns. Their `additionalContext` is appended to the conversation as a `[Hook context]` message. `SessionStart`, `SessionEnd` and `Notification` remain rejected at configuration load rather than silently ignored.
+- MCP clients expose `resources/list`, `resources/read`, `prompts/list` and `prompts/get` on both the stdio and HTTP transports, with bounded list sizes, truncated text and placeholder substitution for binary contents.
+- Extended thinking is requested for Anthropic when a reasoning effort is configured; the budget is derived from effort and kept below `max_tokens`.
+
+### Fixed
+
+- Prompt caching now actually applies. Anthropic ignores a top-level `cache_control`, so the markers moved onto the operator prompt block and the trailing conversation blocks, which is where the Messages API reads them. Caching also no longer requires the official Anthropic host, so Anthropic-compatible relays benefit too.
+- Removed the unused official-host tracking that the previous cache heuristic required.
+
 ## [0.3.2] - 2026-11-14
 
 ### Fixed

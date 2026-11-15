@@ -429,6 +429,8 @@ impl Agent {
         let child_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(
             agency::DEFAULT_SUBAGENT_CONCURRENCY,
         ));
+        let hook_root = self.tools.permissions.root.clone();
+        let turn_hooks = self.tools.hooks().to_vec();
         let mut definitions = Tools::definitions();
         if queue.is_some() {
             if let Some(tool) = definitions.iter_mut().find(|tool| tool.name == "Agent") {
@@ -460,6 +462,8 @@ impl Agent {
         let mut continuation = 0_u32;
         // Text of a cut-off answer accumulates here, so Outcome.text holds the whole reply.
         let mut continued = String::new();
+        // Announced once per turn from the latest operator message.
+        let mut prompt_hook_fired = false;
         loop {
             iteration = iteration.saturating_add(1);
             let last_iteration = self.max_turns != 0 && iteration >= self.max_turns;
@@ -468,6 +472,33 @@ impl Agent {
             }
             if let Some(checkpoint) = checkpoint {
                 checkpoint.update(messages.clone(), true);
+            }
+            if !prompt_hook_fired {
+                prompt_hook_fired = true;
+                let prompt_text = messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::User)
+                    .and_then(|message| {
+                        message.content.iter().rev().find_map(|block| match block {
+                            Content::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default();
+                if let Some(context) = lifecycle_hook(
+                    &turn_hooks,
+                    crate::extensibility::HookEvent::UserPromptSubmit,
+                    &hook_root,
+                    serde_json::json!({"prompt": prompt_text}),
+                )
+                .await
+                {
+                    messages.push(Message::text(
+                        Role::User,
+                        format!("[Hook context] {context}"),
+                    ));
+                }
             }
             let (events, elapsed_ms) = loop {
                 if queue.is_some_and(InputQueue::has_steering) {
@@ -480,10 +511,28 @@ impl Agent {
                     tools: definitions.clone(),
                     max_tokens: self.max_tokens,
                 };
-                let (projection, compact_usage) = self
-                    .compaction
-                    .prepare(&self.client, &request, progress)
-                    .await?;
+                let (projection, compact_usage) = {
+                    let estimated = context::estimate(&request.messages).unwrap_or_default();
+                    if estimated >= self.compaction.window {
+                        if let Some(context) = lifecycle_hook(
+                            &turn_hooks,
+                            crate::extensibility::HookEvent::PreCompact,
+                            &hook_root,
+                            serde_json::json!({"estimated_tokens": estimated, "window": self.compaction.window}),
+                        )
+                        .await
+                        {
+                            messages.push(Message::text(
+                                Role::User,
+                                format!("[Hook context] {context}"),
+                            ));
+                            request.messages = messages.clone();
+                        }
+                    }
+                    self.compaction
+                        .prepare(&self.client, &request, progress)
+                        .await?
+                };
                 request.messages = projection;
                 for (used, elapsed) in compact_usage {
                     usage.input_tokens += used.input_tokens;
@@ -626,6 +675,19 @@ impl Agent {
                 if let Some(checkpoint) = checkpoint {
                     checkpoint.update(messages.clone(), false);
                 }
+                let stop_context = lifecycle_hook(
+                    &turn_hooks,
+                    crate::extensibility::HookEvent::Stop,
+                    &hook_root,
+                    serde_json::json!({"text": text, "iterations": iteration}),
+                )
+                .await;
+                if let Some(context) = stop_context {
+                    messages.push(crate::provider::canonical::Message::text(
+                        crate::provider::canonical::Role::User,
+                        format!("[Hook context] {context}"),
+                    ));
+                }
                 return Ok(Outcome {
                     text,
                     messages,
@@ -674,6 +736,19 @@ impl Agent {
                 }
                 if let Some(checkpoint) = checkpoint {
                     checkpoint.update(messages.clone(), false);
+                }
+                let stop_context = lifecycle_hook(
+                    &turn_hooks,
+                    crate::extensibility::HookEvent::Stop,
+                    &hook_root,
+                    serde_json::json!({"text": text, "iterations": iteration}),
+                )
+                .await;
+                if let Some(context) = stop_context {
+                    messages.push(crate::provider::canonical::Message::text(
+                        crate::provider::canonical::Role::User,
+                        format!("[Hook context] {context}"),
+                    ));
                 }
                 return Ok(Outcome {
                     text,
@@ -1279,6 +1354,46 @@ impl Agent {
     }
 }
 
+/// Fire a lifecycle hook that is not bound to a single tool invocation.
+///
+/// Returns the combined additional context so the caller can decide where it
+/// belongs. A denial is reported as an error message for the model rather than
+/// a hard failure: the lifecycle event has already happened by the time the hook
+/// runs, so blocking it would misreport reality.
+async fn lifecycle_hook(
+    hooks: &[crate::extensibility::HookRule],
+    event: crate::extensibility::HookEvent,
+    root: &std::path::Path,
+    payload: serde_json::Value,
+) -> Option<String> {
+    if hooks.is_empty() || !hooks.iter().any(|rule| rule.event == event) {
+        return None;
+    }
+    let mut payload = payload;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event".into(), serde_json::json!(event));
+        object.insert("cwd".into(), serde_json::json!(root));
+    }
+    let outcome =
+        crate::extensibility::run_matching_hooks_in(hooks, event, None, &payload, Some(root)).await;
+    let mut context = outcome.additional_context.unwrap_or_default();
+    if outcome.decision == crate::extensibility::HookDecision::Deny {
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str("Hook reported: ");
+        context.push_str(outcome.reason.as_deref().unwrap_or("no reason provided"));
+    }
+    if let Some(diagnostic) = outcome.diagnostic {
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str("Hook warning: ");
+        context.push_str(&diagnostic);
+    }
+    (!context.is_empty()).then_some(context)
+}
+
 async fn before_tool_hooks(
     hooks: &[crate::extensibility::HookRule],
     root: &std::path::Path,
@@ -1567,12 +1682,24 @@ async fn run_subagent_inner(
             content,
         });
         if calls.is_empty() {
+            let mut final_text = if text.trim().is_empty() {
+                "Субагент завершил работу без текстового ответа.".to_string()
+            } else {
+                text
+            };
+            if let Some(context) = lifecycle_hook(
+                hooks,
+                crate::extensibility::HookEvent::SubagentStop,
+                &tools.permissions.root,
+                serde_json::json!({"subagent": name, "text": final_text, "iterations": iteration}),
+            )
+            .await
+            {
+                final_text.push_str("\n[Hook context] ");
+                final_text.push_str(&context);
+            }
             return Ok(ChildOutcome {
-                text: if text.trim().is_empty() {
-                    "Субагент завершил работу без текстового ответа.".into()
-                } else {
-                    text
-                },
+                text: final_text,
                 usage,
                 request_usage,
             });

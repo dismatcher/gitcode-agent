@@ -212,7 +212,7 @@ async fn interrupted_turn_keeps_request_completed_tools_and_marks_running_tool()
         tools: vec![],
         max_tokens: 128,
     };
-    let anthropic = gitcode::provider::anthropic::encode(&request)
+    let anthropic = gitcode::provider::anthropic::encode(&request, false)
         .unwrap()
         .to_string();
     let openai = gitcode::provider::openai_chat::encode(&request)

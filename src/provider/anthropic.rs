@@ -7,8 +7,44 @@ use super::{
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Number of trailing message blocks that receive an explicit cache breakpoint.
+///
+/// The Messages API allows at most four `cache_control` markers per request and
+/// the operator prompt consumes one, so the conversation keeps three.
+const MESSAGE_CACHE_BREAKPOINTS: usize = 3;
+
+/// Marks the trailing conversation blocks so a follow-up turn reuses them.
+///
+/// Only the last blocks of the final messages are marked: earlier positions are
+/// served by the longest previously cached prefix, and each extra marker is
+/// charged against the four-marker request limit.
+fn apply_message_cache_breakpoints(messages: &mut [Value]) {
+    let mut remaining = MESSAGE_CACHE_BREAKPOINTS;
+    for message in messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut().rev() {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(object) = block.as_object_mut() {
+                object.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                remaining -= 1;
+            }
+        }
+    }
+}
+
 /// Encode the authoritative Messages wire format.
-pub fn encode(request: &Request) -> Result<Value, String> {
+///
+/// `cache` marks the operator prompt and trailing conversation blocks with
+/// `cache_control`. The Messages API ignores a top-level `cache_control` field,
+/// so the markers must live on content blocks to actually reuse a prompt.
+pub fn encode(request: &Request, cache: bool) -> Result<Value, String> {
     let mut messages = Vec::new();
     for message in &request.messages {
         let role = match message.role {
@@ -34,8 +70,22 @@ pub fn encode(request: &Request) -> Result<Value, String> {
         .iter()
         .map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.input_schema}))
         .collect();
+    // The operator prompt is a stable prefix across every turn, so it is the
+    // cheapest block to cache. Tools accompany it in the same prefix.
+    let system = if cache {
+        json!([{
+            "type":"text",
+            "text":request.system,
+            "cache_control":{"type":"ephemeral"},
+        }])
+    } else {
+        json!(request.system)
+    };
+    if cache {
+        apply_message_cache_breakpoints(&mut messages);
+    }
     Ok(
-        json!({"model":request.model,"system":request.system,"messages":messages,"tools":tools,"max_tokens":request.max_tokens,"stream":true}),
+        json!({"model":request.model,"system":system,"messages":messages,"tools":tools,"max_tokens":request.max_tokens,"stream":true}),
     )
 }
 

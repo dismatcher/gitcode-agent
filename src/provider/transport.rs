@@ -90,7 +90,6 @@ pub struct Client {
     effort: Option<String>,
     prompt_cache: bool,
     cache_key: Option<String>,
-    official_host: Option<String>,
 }
 
 impl Client {
@@ -119,11 +118,6 @@ impl Client {
         {
             return Err("provider URL must use HTTP(S) without embedded credentials".into());
         }
-        let official_host = if url.scheme() == "https" && url.port_or_known_default() == Some(443) {
-            url.host_str().map(str::to_owned)
-        } else {
-            None
-        };
         let mut nonce = [0_u8; 16];
         let cache_key = getrandom::fill(&mut nonce)
             .ok()
@@ -151,7 +145,6 @@ impl Client {
             effort: None,
             prompt_cache: true,
             cache_key,
-            official_host,
         })
     }
 
@@ -173,6 +166,27 @@ impl Client {
     /// Currently selected reasoning effort, if explicitly set.
     pub fn effort(&self) -> Option<&str> {
         self.effort.as_deref()
+    }
+
+    /// Cache markers apply to any Anthropic-compatible endpoint, including
+    /// relays that forward the Messages protocol unchanged.
+    fn cache_enabled(&self) -> bool {
+        self.prompt_cache && self.protocol == Protocol::Anthropic
+    }
+
+    /// Extended-thinking budget derived from the configured effort level.
+    ///
+    /// The Messages API requires `budget_tokens` to stay below `max_tokens`.
+    fn thinking_budget(&self, max_tokens: u32) -> Option<u32> {
+        let share = match self.effort()? {
+            "low" => 4,
+            "medium" => 3,
+            "high" => 2,
+            "xhigh" | "max" => 1,
+            _ => return None,
+        };
+        let budget = max_tokens / share;
+        (budget >= 1_024).then_some(budget.min(max_tokens.saturating_sub(1)))
     }
 
     /// Fetch every model advertised for the current endpoint and credential.
@@ -330,17 +344,21 @@ impl Client {
         progress: Option<&mpsc::Sender<Event>>,
     ) -> Result<Vec<Event>, String> {
         let mut body = match self.protocol {
-            Protocol::Anthropic => anthropic::encode(request)?,
+            Protocol::Anthropic => anthropic::encode(request, self.cache_enabled())?,
             Protocol::OpenaiChat => openai_chat::encode(request)?,
             Protocol::OpenaiResponses => openai_responses::encode(request)?,
         };
         apply_cache_policy(
             &mut body,
             self.protocol,
-            self.official_host.as_deref(),
-            self.prompt_cache,
+            self.cache_enabled(),
             self.cache_key.as_deref(),
         );
+        if self.protocol == Protocol::Anthropic {
+            if let Some(budget) = self.thinking_budget(request.max_tokens) {
+                body["thinking"] = serde_json::json!({"type":"enabled","budget_tokens":budget});
+            }
+        }
         if let Some(effort) = self.effort() {
             match self.protocol {
                 Protocol::Anthropic => {
@@ -607,59 +625,76 @@ mod usage_tests {
     }
 }
 
+/// Anthropic keeps cache markers on content blocks, never at the request root.
+///
+/// The markers are written by [`super::anthropic::encode`]; this function only
+/// handles the OpenAI Responses cache key, which is a genuine top-level field.
 fn apply_cache_policy(
     body: &mut serde_json::Value,
     protocol: Protocol,
-    host: Option<&str>,
     enabled: bool,
     key: Option<&str>,
 ) {
     if !enabled {
         return;
     }
-    match (protocol, host) {
-        (Protocol::Anthropic, Some("api.anthropic.com")) => {
-            body["cache_control"] = serde_json::json!({"type":"ephemeral"})
+    if protocol == Protocol::OpenaiResponses {
+        if let Some(key) = key {
+            body["prompt_cache_key"] = serde_json::json!(key);
         }
-        (Protocol::OpenaiResponses, Some("api.openai.com")) => {
-            if let Some(key) = key {
-                body["prompt_cache_key"] = serde_json::json!(key);
-            }
-        }
-        _ => {}
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod cache_policy_tests {
     use super::*;
+
     #[test]
-    fn cache_hints_are_scoped_to_official_hosts_and_can_be_disabled() {
-        let mut anthropic = serde_json::json!({});
-        apply_cache_policy(
-            &mut anthropic,
-            Protocol::Anthropic,
-            Some("api.anthropic.com"),
-            true,
-            None,
+    fn anthropic_cache_markers_live_on_blocks_not_the_request_root() {
+        let request = Request {
+            model: "claude-test".into(),
+            system: "operator prompt".into(),
+            messages: vec![crate::provider::canonical::Message {
+                role: crate::provider::canonical::Role::User,
+                content: vec![crate::provider::canonical::Content::Text {
+                    text: "hello".into(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+        };
+        let cached = super::super::anthropic::encode(&request, true).unwrap();
+        assert!(cached.get("cache_control").is_none());
+        assert_eq!(cached["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            cached["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
         );
-        assert_eq!(anthropic["cache_control"]["type"], "ephemeral");
+        let plain = super::super::anthropic::encode(&request, false).unwrap();
+        assert_eq!(plain["system"], serde_json::json!("operator prompt"));
+        assert!(plain["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn openai_responses_cache_key_is_added_and_can_be_disabled() {
         let mut openai = serde_json::json!({});
         apply_cache_policy(
             &mut openai,
             Protocol::OpenaiResponses,
-            Some("api.openai.com"),
             true,
             Some("random-session"),
         );
         assert_eq!(openai["prompt_cache_key"], "random-session");
-        for (protocol, host, enabled) in [
-            (Protocol::Anthropic, "relay.example", true),
-            (Protocol::OpenaiResponses, "api.openai.com", false),
-            (Protocol::OpenaiChat, "api.openai.com", true),
+        for (protocol, enabled) in [
+            (Protocol::OpenaiResponses, false),
+            (Protocol::OpenaiChat, true),
+            (Protocol::Anthropic, true),
         ] {
             let mut body = serde_json::json!({});
-            apply_cache_policy(&mut body, protocol, Some(host), enabled, Some("x"));
+            apply_cache_policy(&mut body, protocol, enabled, Some("x"));
             assert_eq!(body, serde_json::json!({}));
         }
     }

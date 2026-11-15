@@ -164,7 +164,7 @@ fn inline_attachments_survive_import_resume_and_all_provider_encoders() {
         tools: vec![],
         max_tokens: 128,
     };
-    let anthropic = anthropic::encode(&request).unwrap();
+    let anthropic = anthropic::encode(&request, true).unwrap();
     assert_eq!(
         anthropic["messages"][0]["content"][1]["source"]["data"],
         "aW1hZ2U="
@@ -356,7 +356,7 @@ fn structured_blocks_keep_replay_identifiers_arguments_and_reasoning() {
         tools: vec![],
         max_tokens: 128,
     };
-    let wire = anthropic::encode(&request).unwrap();
+    let wire = anthropic::encode(&request, true).unwrap();
     assert_eq!(wire["messages"][0]["content"][0]["signature"], "signed");
     assert_eq!(
         wire["messages"][0]["content"][1]["input"],

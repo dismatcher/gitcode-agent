@@ -195,15 +195,22 @@ impl Config {
                     "must be between 1 and 60000",
                 ));
             }
+            // SessionStart, SessionEnd and Notification need session lifecycle
+            // plumbing that is not wired yet; accepting them would silently
+            // never fire.
             if !matches!(
                 hook.event,
                 crate::extensibility::HookEvent::PreToolUse
                     | crate::extensibility::HookEvent::PostToolUse
+                    | crate::extensibility::HookEvent::UserPromptSubmit
+                    | crate::extensibility::HookEvent::Stop
+                    | crate::extensibility::HookEvent::SubagentStop
+                    | crate::extensibility::HookEvent::PreCompact
             ) {
                 return Err(invalid(
                     source,
                     "hooks.event",
-                    "only PreToolUse and PostToolUse are currently dispatched",
+                    "SessionStart, SessionEnd and Notification are not dispatched yet",
                 ));
             }
             if hook
