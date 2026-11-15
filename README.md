@@ -41,6 +41,23 @@ GitCode is under active development. Review proposed actions and changes, and us
 
 Prebuilt archives and checksums are available on [GitHub Releases](https://github.com/jaddd14/gitcode-agent/releases). Download the archive for your operating system, verify its SHA-256 against `SHA256SUMS`, and put the `gitcode` executable on your `PATH`. The release assets also include per-user installers.
 
+The installers download the archive for the current platform, check its SHA-256 before touching your `PATH`, and fall back to GitHub Releases if the primary mirror is unavailable.
+
+Linux and macOS:
+
+```sh
+curl -fsSL https://api.samp.team/gitcode/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://api.samp.team/gitcode/install.ps1 | iex
+```
+
+On Windows the binary is placed in `%LOCALAPPDATA%\Programs\gitcode\bin` and added to the user `PATH`; ARM64 runs the x64 build under emulation. Restart the shell afterwards. The Linux archives are built against glibc 2.34, so they run on Ubuntu 22.04 and newer, Debian 12 and newer, and equivalent distributions.
+
+
 For a source build, install the toolchain specified in `rust-toolchain.toml` and run:
 
 ```sh
