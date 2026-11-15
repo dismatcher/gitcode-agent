@@ -33,6 +33,8 @@ pub struct Tools {
     todos: crate::agent::agency::TodoList,
     approved_shell_prefixes: Vec<String>,
     shell_selection: String,
+    hooks: Vec<crate::extensibility::HookRule>,
+    mcp_stdio: BTreeMap<String, (crate::mcp::McpServerConfig, crate::mcp::StdioMcpSession)>,
 }
 
 impl Tools {
@@ -48,7 +50,19 @@ impl Tools {
             todos: crate::agent::agency::TodoList::new(),
             approved_shell_prefixes: Vec::new(),
             shell_selection: "auto".into(),
+            hooks: Vec::new(),
+            mcp_stdio: BTreeMap::new(),
         }
+    }
+
+    /// Configure explicitly trusted lifecycle hooks.
+    pub fn set_hooks(&mut self, hooks: Vec<crate::extensibility::HookRule>) {
+        self.hooks = hooks;
+    }
+
+    /// Hooks configured for this executor.
+    pub fn hooks(&self) -> &[crate::extensibility::HookRule] {
+        &self.hooks
     }
 
     /// Shared completion handles for reporting active background jobs.
@@ -59,6 +73,9 @@ impl Tools {
     /// Stop owned background jobs and reap the persistent interpreter before
     /// releasing its workspace (Windows processes hold their current directory).
     pub async fn shutdown(&mut self) -> Result<(), String> {
+        for (_, (_, session)) in std::mem::take(&mut self.mcp_stdio) {
+            session.close().await;
+        }
         for (_, job) in std::mem::take(&mut self.jobs) {
             job.kill().await?;
         }
@@ -232,18 +249,49 @@ impl Tools {
                         .await
                         .map_err(|_| "cannot load MCP configuration")?
                         .map_err(|_| "invalid MCP configuration")?;
-                let configured = config.servers.get(&server).ok_or("unknown MCP server")?;
+                let configured = match config.servers.get(&server) {
+                    Some(configured) => configured,
+                    None => {
+                        self.mcp_stdio.remove(&server);
+                        return Err("unknown MCP server".into());
+                    }
+                };
+                if !matches!(configured, crate::mcp::McpServerConfig::Stdio { .. }) {
+                    self.mcp_stdio.remove(&server);
+                }
                 return match configured {
                     crate::mcp::McpServerConfig::Stdio { command, args, env } => {
-                        crate::mcp::StdioMcpClient::new(
-                            command,
-                            args.clone(),
-                            env.clone(),
-                            Duration::from_secs(30),
-                        )
-                        .call_tool(&tool, arguments)
-                        .await
-                        .map_err(|_| "MCP tool request failed".into())
+                        if self
+                            .mcp_stdio
+                            .get(&server)
+                            .is_some_and(|(old, _)| old != configured)
+                        {
+                            self.mcp_stdio.remove(&server);
+                        }
+                        if !self.mcp_stdio.contains_key(&server) {
+                            let session = crate::mcp::StdioMcpSession::connect(
+                                command,
+                                args,
+                                env,
+                                Duration::from_secs(30),
+                            )
+                            .await
+                            .map_err(|_| "MCP server initialization failed")?;
+                            self.mcp_stdio
+                                .insert(server.clone(), (configured.clone(), session));
+                        }
+                        // Remove the connection while the request is in flight: if
+                        // the caller cancels, dropping the future kills the process
+                        // instead of reusing a stream with an outstanding response.
+                        let (configuration, mut session) = self
+                            .mcp_stdio
+                            .remove(&server)
+                            .ok_or("MCP session unavailable")?;
+                        let result = session.call_tool(&tool, arguments).await;
+                        if result.is_ok() {
+                            self.mcp_stdio.insert(server, (configuration, session));
+                        }
+                        result.map_err(|_| "MCP tool request failed".into())
                     }
                     crate::mcp::McpServerConfig::Http { url, headers } => {
                         crate::mcp::HttpMcpClient::new(

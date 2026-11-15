@@ -96,3 +96,101 @@ async fn stdio_and_http_sse_mcp_clients_execute_tools() {
     }]);
     assert!(lines[0].contains("local [stdio] — connected (2 tools)"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_tools_reuse_stdio_session_and_recheck_permissions() {
+    use gitcode::{
+        perm::{Engine, Mode, Rule},
+        tools::Tools,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let log = root.join("starts.log");
+    let script = r#"
+printf 'start\n' >> "$MCP_TEST_LOG"
+IFS= read -r init || exit 1
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}\n'
+IFS= read -r initialized || exit 1
+n=2
+while IFS= read -r request; do
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"call-%s"}]}}\n' "$n" "$n"
+  n=$((n+1))
+done
+"#;
+    let make_config = |variant: &str| McpServerConfig::Stdio {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: BTreeMap::from([
+            ("MCP_TEST_LOG".into(), log.to_string_lossy().into_owned()),
+            ("MCP_TEST_VARIANT".into(), variant.into()),
+        ]),
+    };
+    let path = root.join(".mcp.json");
+    add_mcp_server(&path, "local", make_config("one")).unwrap();
+    let mut tools = Tools::new(Engine::new(&root, Mode::Bypass).unwrap());
+    let input = json!({"server":"local","tool":"echo","arguments":{}});
+    assert_eq!(tools.execute("McpCall", &input).await.unwrap(), "call-2");
+    assert_eq!(tools.execute("McpCall", &input).await.unwrap(), "call-3");
+    tools
+        .permissions
+        .deny
+        .push(Rule::parse("McpCall(*)").unwrap());
+    assert!(tools.execute("McpCall", &input).await.is_err());
+    tools.permissions.deny.clear();
+    assert_eq!(tools.execute("McpCall", &input).await.unwrap(), "call-4");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    add_mcp_server(&path, "local", make_config("two")).unwrap();
+    assert_eq!(tools.execute("McpCall", &input).await.unwrap(), "call-2");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    tools.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_stdio_request_does_not_reuse_an_unfinished_connection() {
+    use gitcode::{
+        perm::{Engine, Mode},
+        tools::Tools,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let log = root.join("starts.log");
+    let marker = root.join("blocked-once");
+    let script = r#"
+printf 'start\n' >> "$MCP_TEST_LOG"
+IFS= read -r init || exit 1
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}\n'
+IFS= read -r initialized || exit 1
+while IFS= read -r request; do
+  if [ ! -e "$MCP_TEST_MARKER" ]; then
+    : > "$MCP_TEST_MARKER"
+    sleep 10
+  fi
+  printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"fresh"}]}}\n'
+done
+"#;
+    let server = McpServerConfig::Stdio {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: BTreeMap::from([
+            ("MCP_TEST_LOG".into(), log.to_string_lossy().into_owned()),
+            (
+                "MCP_TEST_MARKER".into(),
+                marker.to_string_lossy().into_owned(),
+            ),
+        ]),
+    };
+    add_mcp_server(&root.join(".mcp.json"), "local", server).unwrap();
+    let mut tools = Tools::new(Engine::new(&root, Mode::Bypass).unwrap());
+    let input = json!({"server":"local","tool":"echo","arguments":{}});
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), tools.execute("McpCall", &input))
+            .await
+            .is_err()
+    );
+    assert!(marker.exists());
+    assert_eq!(tools.execute("McpCall", &input).await.unwrap(), "fresh");
+    assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 2);
+    tools.shutdown().await.unwrap();
+}

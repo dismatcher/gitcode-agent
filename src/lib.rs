@@ -15,6 +15,8 @@ pub mod model_preferences;
 pub mod paths;
 pub mod perm;
 pub mod platform;
+/// Explicitly enabled local hook plugins.
+pub mod plugins;
 pub mod provider;
 pub mod session;
 pub mod shell;

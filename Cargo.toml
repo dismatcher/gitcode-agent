@@ -58,6 +58,12 @@ panic = "abort"
 strip = true
 opt-level = 3
 
+# Fast optimized builds for local deployment; the release profile remains unchanged.
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

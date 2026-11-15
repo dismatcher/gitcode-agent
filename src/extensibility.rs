@@ -906,15 +906,22 @@ pub enum HookEvent {
 
 /// A configured command hook rule associated with a [`HookEvent`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookRule {
     /// Lifecycle event that triggers this rule.
     pub event: HookEvent,
     /// Optional regex or exact matcher string tested against the target (e.g. tool name).
+    #[serde(default)]
     pub matcher: Option<String>,
     /// POSIX shell command executed via `/bin/sh -c` (Git Bash on Windows).
     pub command: String,
     /// Execution timeout in milliseconds.
+    #[serde(default = "default_hook_timeout")]
     pub timeout_ms: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    5_000
 }
 
 impl HookRule {
@@ -972,11 +979,31 @@ struct HookStdoutJson {
     additional_context: Option<String>,
 }
 
+const MAX_HOOK_OUTPUT: usize = 64 * 1024;
+
+async fn read_hook_output<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> io::Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let n = reader.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        let remaining = MAX_HOOK_OUTPUT.saturating_sub(result.len());
+        result.extend_from_slice(&buffer[..n.min(remaining)]);
+    }
+    Ok(result)
+}
+
 /// Executes a [`HookRule`] via POSIX sh (native Git Bash on Windows), passing JSON on stdin and
 /// enforcing `rule.timeout_ms`.
 ///
 /// The raw `rule.command` string is never included in any error or diagnostic message.
 pub async fn run_hook(rule: &HookRule, payload: &Value) -> HookOutcome {
+    run_hook_in(rule, payload, None).await
+}
+
+async fn run_hook_in(rule: &HookRule, payload: &Value, cwd: Option<&Path>) -> HookOutcome {
     let timeout_dur = Duration::from_millis(rule.timeout_ms.max(1));
     let payload_bytes = serde_json::to_vec(payload).unwrap_or_else(|_| b"{}".to_vec());
 
@@ -994,7 +1021,11 @@ pub async fn run_hook(rule: &HookRule, payload: &Value) -> HookOutcome {
     };
     #[cfg(not(windows))]
     let executable = std::path::PathBuf::from("/bin/sh");
-    let mut child = match Command::new(executable)
+    let mut command = Command::new(executable);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = match command
         .arg("-c")
         .arg(&rule.command)
         .stdin(Stdio::piped())
@@ -1018,24 +1049,31 @@ pub async fn run_hook(rule: &HookRule, payload: &Value) -> HookOutcome {
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&payload_bytes).await;
-        let _ = stdin.shutdown().await;
-    }
-
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
+    let stdin = child.stdin.take();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    // Consume both output streams while writing input; otherwise a hook that fills
+    // stderr before closing stdout can deadlock. Bound retained data, not draining.
     let wait_fut = async {
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
-        if let Some(ref mut out) = stdout_pipe {
-            let _ = out.read_to_end(&mut stdout_buf).await;
-        }
-        if let Some(ref mut err) = stderr_pipe {
-            let _ = err.read_to_end(&mut stderr_buf).await;
-        }
-        let status = child.wait().await;
+        let write = async {
+            if let Some(mut stdin) = stdin {
+                let _ = stdin.write_all(&payload_bytes).await;
+                let _ = stdin.shutdown().await;
+            }
+        };
+        let stdout = async {
+            match stdout_pipe {
+                Some(pipe) => read_hook_output(pipe).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        };
+        let stderr = async {
+            match stderr_pipe {
+                Some(pipe) => read_hook_output(pipe).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        };
+        let (_, stdout_buf, stderr_buf, status) = tokio::join!(write, stdout, stderr, child.wait());
         (status, stdout_buf, stderr_buf)
     };
 
@@ -1135,6 +1173,17 @@ pub async fn run_matching_hooks(
     target: Option<&str>,
     payload: &Value,
 ) -> HookOutcome {
+    run_matching_hooks_in(rules, event, target, payload, None).await
+}
+
+/// Run matching hooks with a fixed working directory.
+pub async fn run_matching_hooks_in(
+    rules: &[HookRule],
+    event: HookEvent,
+    target: Option<&str>,
+    payload: &Value,
+    cwd: Option<&Path>,
+) -> HookOutcome {
     let mut combined_context: Vec<String> = Vec::new();
     let mut last_diagnostic: Option<String> = None;
 
@@ -1142,7 +1191,7 @@ pub async fn run_matching_hooks(
         if !rule.matches(event, target) {
             continue;
         }
-        let outcome = run_hook(rule, payload).await;
+        let outcome = run_hook_in(rule, payload, cwd).await;
         if let Some(ctx) = outcome.additional_context {
             if !ctx.is_empty() {
                 combined_context.push(ctx);

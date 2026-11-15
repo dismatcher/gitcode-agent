@@ -79,6 +79,10 @@ pub struct Config {
     pub theme: crate::theme::ThemeChoice,
     /// Shell selection: auto, bash, pwsh, powershell, or cmd.
     pub shell: String,
+    /// Explicitly configured lifecycle hooks; project-defined commands require trust.
+    pub hooks: Vec<crate::extensibility::HookRule>,
+    /// Names of explicitly enabled local hook plugins.
+    pub plugins: Vec<String>,
 }
 
 impl Default for Config {
@@ -94,6 +98,8 @@ impl Default for Config {
             intro: true,
             theme: crate::theme::ThemeChoice::default(),
             shell: "auto".into(),
+            hooks: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 }
@@ -155,6 +161,63 @@ impl Config {
                 return Err(invalid(source, key, reason));
             }
         }
+        if self.plugins.len() > 32
+            || self
+                .plugins
+                .iter()
+                .any(|name| !crate::plugins::valid_name(name))
+        {
+            return Err(invalid(
+                source,
+                "plugins",
+                "plugin names must be unique simple names (at most 32)",
+            ));
+        }
+        let unique: std::collections::BTreeSet<_> = self.plugins.iter().collect();
+        if unique.len() != self.plugins.len() {
+            return Err(invalid(source, "plugins", "plugin names must be unique"));
+        }
+        if self.hooks.len() > 32 {
+            return Err(invalid(source, "hooks", "at most 32 hooks are allowed"));
+        }
+        for hook in &self.hooks {
+            if hook.command.trim().is_empty() || hook.command.len() > 16_384 {
+                return Err(invalid(
+                    source,
+                    "hooks.command",
+                    "must be nonempty and at most 16384 bytes",
+                ));
+            }
+            if !(1..=60_000).contains(&hook.timeout_ms) {
+                return Err(invalid(
+                    source,
+                    "hooks.timeout_ms",
+                    "must be between 1 and 60000",
+                ));
+            }
+            if !matches!(
+                hook.event,
+                crate::extensibility::HookEvent::PreToolUse
+                    | crate::extensibility::HookEvent::PostToolUse
+            ) {
+                return Err(invalid(
+                    source,
+                    "hooks.event",
+                    "only PreToolUse and PostToolUse are currently dispatched",
+                ));
+            }
+            if hook
+                .matcher
+                .as_ref()
+                .is_some_and(|value| value.len() > 1024)
+            {
+                return Err(invalid(
+                    source,
+                    "hooks.matcher",
+                    "must be at most 1024 bytes",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -199,6 +262,20 @@ pub fn load(
                         ));
                     }
                     if !trusted {
+                        if layer.get("hooks").is_some() {
+                            return Err(invalid(
+                                &path,
+                                "hooks",
+                                "project hooks require explicit user trust",
+                            ));
+                        }
+                        if layer.get("plugins").is_some() {
+                            return Err(invalid(
+                                &path,
+                                "plugins",
+                                "project plugins require explicit user trust",
+                            ));
+                        }
                         if has_environment_expansion(&layer) {
                             return Err(invalid(
                                 &path,

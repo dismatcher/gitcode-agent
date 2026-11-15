@@ -77,7 +77,7 @@ async fn children_run_in_parallel_with_isolated_context_and_enforced_read_only_t
                     if messages.len() == 1 {
                         tokio::time::timeout(Duration::from_secs(5), barrier.wait()).await.expect("children must run concurrently");
                         if first.contains("TASK_ALPHA") {
-                            tool_reply(&[("evil", "Write", serde_json::json!({"path":"blocked.txt","content":"forbidden"})), ("nested", "Agent", serde_json::json!({"subagent_type":"explore","description":"nested","prompt":"nested"}))])
+                            tool_reply(&[("evil", "Write", serde_json::json!({"path":"blocked.txt","content":"forbidden"})), ("nested", "Agent", serde_json::json!({"subagent_type":"explore","description":"nested","prompt":"nested"})), ("read", "Read", serde_json::json!({"path":"blocked.txt"}))])
                         } else {
                             assert!(first.contains("TASK_BETA"));
                             text_reply("beta report")
@@ -86,6 +86,8 @@ async fn children_run_in_parallel_with_isolated_context_and_enforced_read_only_t
                         assert!(first.contains("TASK_ALPHA"));
                         assert!(body["messages"].to_string().contains("Tool Write is not permitted"));
                         assert!(body["messages"].to_string().contains("Tool Agent is not permitted"));
+                        #[cfg(unix)]
+                        assert!(body["messages"].to_string().contains("child hook blocked read"));
                         text_reply("alpha report")
                     }
                 };
@@ -103,9 +105,21 @@ async fn children_run_in_parallel_with_isolated_context_and_enforced_read_only_t
         Duration::from_secs(10),
     )
     .unwrap();
+    let tools = Tools::new(Engine::new(&root, Mode::Bypass).unwrap());
+    #[cfg(unix)]
+    let tools = {
+        let mut tools = tools;
+        tools.set_hooks(vec![gitcode::extensibility::HookRule {
+            event: gitcode::extensibility::HookEvent::PreToolUse,
+            matcher: Some("Read".into()),
+            command: "echo 'child hook blocked read' >&2; exit 2".into(),
+            timeout_ms: 5000,
+        }]);
+        tools
+    };
     let mut agent = Agent {
         client,
-        tools: Tools::new(Engine::new(&root, Mode::Bypass).unwrap()),
+        tools,
         model: "mock".into(),
         system: BASE_PROMPT.into(),
         max_turns: 0,

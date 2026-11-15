@@ -348,6 +348,18 @@ async fn run(cli: Cli, logger: &mut Logger) -> Result<(), String> {
         );
     }
     let mut config = config_res.map_err(|e| e.to_string())?;
+    let plugin_home = home.clone();
+    let enabled_plugins = config.plugins.clone();
+    let plugin_hooks =
+        tokio::task::spawn_blocking(move || gitcode::plugins::load(&plugin_home, &enabled_plugins))
+            .await
+            .map_err(|_| "не удалось загрузить плагины")?
+            .map_err(|e| format!("не удалось загрузить плагины: {e}"))?;
+    config.hooks.extend(plugin_hooks);
+    config
+        .validate(std::path::Path::new("enabled plugins"))
+        .map_err(|e| e.to_string())?;
+
     if let Some(url) = cli.base_url {
         config.provider.base_url = url;
     }
@@ -427,7 +439,8 @@ async fn run(cli: Cli, logger: &mut Logger) -> Result<(), String> {
         engine.add_workspace(directory)?;
     }
     let additional_roots = engine.additional_roots.clone();
-    let tools = Tools::with_shell(engine, &config.shell)?;
+    let mut tools = Tools::with_shell(engine, &config.shell)?;
+    tools.set_hooks(config.hooks.clone());
     let shell = tools.shell()?;
     let mut system = cli.system_prompt.unwrap_or_else(|| BASE_PROMPT.into());
     system.push_str(&format!(

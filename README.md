@@ -35,7 +35,7 @@ GitCode is under active development. Review proposed actions and changes, and us
 - Supports Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and compatible endpoints. Provider credentials stay in your environment or local credential store.
 - Saves sessions locally, resumes conversations, and imports supported Claude Code and Codex journals. `/context` shows the estimated context and `/compact` creates a new summary on demand.
 - Summarizes older history as the configured context limit approaches while keeping recent messages and tool-call pairs together. The original session remains available locally. Summaries are model-generated and can omit details; they incur provider usage.
-- Offers terminal and noninteractive modes, usage accounting, configurable agents, skills, web fetch, and configured MCP tool calls. Integration coverage varies; see the guides below for limitations.
+- Offers terminal and noninteractive modes, usage accounting, configurable agents, skills, trusted pre/post tool hooks and local hook plugins, web fetch, and configured MCP tool calls with reusable stdio sessions. Integration coverage varies; see the guides below for limitations.
 
 ## <img src="assets/icons/rocket.svg" alt="" width="20" height="20"> Install
 
@@ -49,6 +49,8 @@ cd gitcode-agent
 cargo build --release --locked
 ./target/release/gitcode --version
 ```
+
+For faster optimized local builds after the first build, use `cargo build --profile release-fast --locked`; the binary is `target/release-fast/gitcode`. The standard release profile remains the distribution build.
 
 GitCode supports Linux, macOS, and Windows. Platform details and terminal requirements are documented in [Windows](docs/windows.md). Interactive disconnect recovery uses tmux on Unix when available; Windows uses psmux when configured.
 

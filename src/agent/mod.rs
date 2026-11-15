@@ -712,13 +712,48 @@ impl Agent {
                         }
                     }
                     let permissions = self.tools.permissions.clone();
+                    let hooks = self.tools.hooks().to_vec();
                     let work = calls[index..end].iter().cloned().enumerate().map(
                         |(offset, (id, name, input))| {
                             let permissions = permissions.clone();
+                            let hooks = hooks.clone();
                             async move {
                                 let started = std::time::Instant::now();
                                 let mut tools = Tools::new(permissions);
-                                let result = tools.execute(&name, &input).await;
+                                let result = match before_tool_hooks(
+                                    &hooks,
+                                    &tools.permissions.root,
+                                    &id,
+                                    &name,
+                                    &input,
+                                )
+                                .await
+                                {
+                                    Err(error) => Err(error),
+                                    Ok(context) => {
+                                        let (output, is_error) =
+                                            match tools.execute(&name, &input).await {
+                                                Ok(output) => (output, false),
+                                                Err(error) => (error, true),
+                                            };
+                                        let output = after_tool_hooks(
+                                            &hooks,
+                                            &tools.permissions.root,
+                                            &id,
+                                            &name,
+                                            &input,
+                                            output,
+                                            is_error,
+                                            context,
+                                        )
+                                        .await;
+                                        if is_error {
+                                            Err(output)
+                                        } else {
+                                            Ok(output)
+                                        }
+                                    }
+                                };
                                 let elapsed =
                                     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                                 (offset, id, name, result, tools.read_state, elapsed)
@@ -757,6 +792,51 @@ impl Agent {
                     }
                     continue;
                 }
+                let hook_context = if name == "Agent" && queue.is_none() {
+                    None
+                } else {
+                    match before_tool_hooks(
+                        self.tools.hooks(),
+                        &self.tools.permissions.root,
+                        id,
+                        name,
+                        input,
+                    )
+                    .await
+                    {
+                        Ok(context) => context,
+                        Err(error) => {
+                            if let Some(progress) = progress {
+                                let _ = progress
+                                    .send(Event::ToolStarted {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        input: input.clone(),
+                                    })
+                                    .await;
+                                let _ = progress
+                                    .send(Event::ToolFinished {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        output: error.clone(),
+                                        is_error: true,
+                                        duration_ms: 0,
+                                    })
+                                    .await;
+                            }
+                            results.push(Content::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: error,
+                                is_error: true,
+                            });
+                            index += 1;
+                            if let Some(checkpoint) = checkpoint {
+                                checkpoint_tools(checkpoint, &messages, &results, &calls, None);
+                            }
+                            continue;
+                        }
+                    }
+                };
                 if name == "Agent" && queue.is_some() {
                     let client = self.client.clone();
                     let permissions = self.tools.permissions.clone();
@@ -766,6 +846,7 @@ impl Agent {
                     let max_tokens = self.max_tokens;
                     let child_id = id.clone();
                     let child_input = input.clone();
+                    let hooks = self.tools.hooks().to_vec();
                     let sender = progress.cloned();
                     let slots = child_slots.clone();
                     if let Some(progress) = progress {
@@ -790,6 +871,7 @@ impl Agent {
                                     max_tokens,
                                     &child_id,
                                     &child_input,
+                                    &hooks,
                                     sender.as_ref(),
                                 )
                                 .await
@@ -799,6 +881,17 @@ impl Agent {
                         (child_id, outcome)
                     });
                     let output = format!("Субагент {id} запущен в фоне. Продолжайте независимую работу и отвечайте на новые сообщения; результат будет передан автоматически.");
+                    let output = after_tool_hooks(
+                        self.tools.hooks(),
+                        &self.tools.permissions.root,
+                        id,
+                        name,
+                        input,
+                        output,
+                        false,
+                        hook_context,
+                    )
+                    .await;
                     results.push(Content::ToolResult {
                         tool_use_id: id.clone(),
                         content: output.clone(),
@@ -850,31 +943,56 @@ impl Agent {
                             let system = self.system.clone();
                             let max_turns = self.max_turns;
                             let max_tokens = self.max_tokens;
+                            let hooks = self.tools.hooks().to_vec();
                             async move {
                                 let started = std::time::Instant::now();
-                                let outcome = run_subagent(
-                                    client,
-                                    permissions,
-                                    model,
-                                    system,
-                                    max_turns,
-                                    max_tokens,
+                                let before = before_tool_hooks(
+                                    &hooks,
+                                    &permissions.root,
                                     &id,
+                                    &name,
                                     &input,
-                                    progress,
                                 )
                                 .await;
+                                let (outcome, context, invoked) = match before {
+                                    Ok(context) => (
+                                        run_subagent(
+                                            client,
+                                            permissions,
+                                            model,
+                                            system,
+                                            max_turns,
+                                            max_tokens,
+                                            &id,
+                                            &input,
+                                            &hooks,
+                                            progress,
+                                        )
+                                        .await,
+                                        context,
+                                        true,
+                                    ),
+                                    Err(error) => (Err(error), None, false),
+                                };
                                 let elapsed =
                                     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                                (offset, id, name, input, outcome, elapsed)
+                                (offset, id, name, input, outcome, elapsed, context, invoked)
                             }
                         },
                     );
                     let mut pending =
                         stream::iter(work).buffer_unordered(agency::DEFAULT_SUBAGENT_CONCURRENCY);
                     let mut completed = std::collections::BTreeMap::new();
-                    while let Some((offset, child_id, child_name, child_input, outcome, elapsed)) =
-                        pending.next().await
+                    while let Some((
+                        offset,
+                        child_id,
+                        child_name,
+                        child_input,
+                        outcome,
+                        elapsed,
+                        child_context,
+                        invoked,
+                    )) = pending.next().await
                     {
                         let (output, is_error) = match outcome {
                             Ok(child) => {
@@ -888,6 +1006,21 @@ impl Agent {
                                 (child.text, false)
                             }
                             Err(error) => (error, true),
+                        };
+                        let output = if invoked {
+                            after_tool_hooks(
+                                self.tools.hooks(),
+                                &self.tools.permissions.root,
+                                &child_id,
+                                &child_name,
+                                &child_input,
+                                output,
+                                is_error,
+                                child_context,
+                            )
+                            .await
+                        } else {
+                            output
                         };
                         completed.insert(
                             offset,
@@ -1097,6 +1230,17 @@ impl Agent {
                     Ok(text) => (text, false),
                     Err(error) => (error, true),
                 };
+                let content = after_tool_hooks(
+                    self.tools.hooks(),
+                    &self.tools.permissions.root,
+                    id,
+                    name,
+                    input,
+                    content,
+                    is_error,
+                    hook_context,
+                )
+                .await;
                 results.push(Content::ToolResult {
                     tool_use_id: id.clone(),
                     content: content.clone(),
@@ -1133,6 +1277,92 @@ impl Agent {
             apply_queued_messages(queue, &mut messages, checkpoint, progress).await;
         }
     }
+}
+
+async fn before_tool_hooks(
+    hooks: &[crate::extensibility::HookRule],
+    root: &std::path::Path,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    if hooks.is_empty() {
+        return Ok(None);
+    }
+    let payload = serde_json::json!({"event":"PreToolUse", "tool_use_id":id, "tool_name":name, "tool_input":input, "cwd":root});
+    let outcome = crate::extensibility::run_matching_hooks_in(
+        hooks,
+        crate::extensibility::HookEvent::PreToolUse,
+        Some(name),
+        &payload,
+        Some(root),
+    )
+    .await;
+    if outcome.decision == crate::extensibility::HookDecision::Deny {
+        return Err(format!(
+            "Blocked by PreToolUse hook: {}",
+            outcome
+                .reason
+                .unwrap_or_else(|| "no reason provided".into())
+        ));
+    }
+    let mut context = outcome.additional_context.unwrap_or_default();
+    if let Some(diagnostic) = outcome.diagnostic {
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str("Hook warning: ");
+        context.push_str(&diagnostic);
+    }
+    Ok((!context.is_empty()).then_some(context))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn after_tool_hooks(
+    hooks: &[crate::extensibility::HookRule],
+    root: &std::path::Path,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    mut output: String,
+    is_error: bool,
+    before_context: Option<String>,
+) -> String {
+    if hooks.is_empty() {
+        return output;
+    }
+    let payload = serde_json::json!({"event":"PostToolUse", "tool_use_id":id, "tool_name":name, "tool_input":input, "tool_output":output, "is_error":is_error, "cwd":root});
+    let outcome = crate::extensibility::run_matching_hooks_in(
+        hooks,
+        crate::extensibility::HookEvent::PostToolUse,
+        Some(name),
+        &payload,
+        Some(root),
+    )
+    .await;
+    for context in [before_context, outcome.additional_context]
+        .into_iter()
+        .flatten()
+    {
+        if !context.trim().is_empty() {
+            output.push_str("\n[Hook context] ");
+            output.push_str(&context);
+        }
+    }
+    if let Some(diagnostic) = outcome.diagnostic {
+        output.push_str("\n[Hook warning] ");
+        output.push_str(&diagnostic);
+    }
+    if outcome.decision == crate::extensibility::HookDecision::Deny {
+        output.push_str("\n[PostToolUse hook] ");
+        output.push_str(
+            outcome
+                .reason
+                .as_deref()
+                .unwrap_or("reported a failure after execution"),
+        );
+    }
+    output
 }
 
 struct ChildOutcome {
@@ -1174,6 +1404,7 @@ async fn run_subagent(
     max_tokens: u32,
     id: &str,
     input: &serde_json::Value,
+    hooks: &[crate::extensibility::HookRule],
     progress: Option<&mpsc::Sender<Event>>,
 ) -> Result<ChildOutcome, String> {
     let name = input
@@ -1202,6 +1433,7 @@ async fn run_subagent(
         max_tokens,
         id,
         input,
+        hooks,
         progress,
     )
     .await;
@@ -1227,6 +1459,7 @@ async fn run_subagent_inner(
     max_tokens: u32,
     id: &str,
     input: &serde_json::Value,
+    hooks: &[crate::extensibility::HookRule],
     progress: Option<&mpsc::Sender<Event>>,
 ) -> Result<ChildOutcome, String> {
     let name = input
@@ -1355,13 +1588,30 @@ async fn run_subagent_inner(
                     })
                     .await;
             }
-            let result = if profile.allows_tool(&name) {
-                tools.execute(&name, &input).await
+            let before = if profile.allows_tool(&name) {
+                before_tool_hooks(hooks, &tools.permissions.root, &call_id, &name, &input).await
             } else {
                 Err(format!("Tool {name} is not permitted for this subagent"))
             };
-            let (content, is_error) = match result {
-                Ok(content) => (content, false),
+            let (content, is_error) = match before {
+                Ok(context) => {
+                    let (content, is_error) = match tools.execute(&name, &input).await {
+                        Ok(content) => (content, false),
+                        Err(error) => (error, true),
+                    };
+                    let content = after_tool_hooks(
+                        hooks,
+                        &tools.permissions.root,
+                        &call_id,
+                        &name,
+                        &input,
+                        content,
+                        is_error,
+                        context,
+                    )
+                    .await;
+                    (content, is_error)
+                }
                 Err(error) => (error, true),
             };
             results.push(Content::ToolResult {

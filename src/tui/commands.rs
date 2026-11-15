@@ -1109,14 +1109,13 @@ pub async fn execute_command(
             "/export сохранить весь диалог в файл"
         }
         "hooks" => {
-            body.extend([
-                "Поддерживаемые события жизненного цикла (hooks):".into(),
-                " • PreToolUse / PostToolUse — проверка и аудит вызовов инструментов".into(),
-                " • UserPromptSubmit / Stop / SubagentStop — обработка хода".into(),
-                " • SessionStart / SessionEnd / Notification / PreCompact".into(),
-                "Код возврата 2 блокирует действие и передаёт причину модели.".into(),
-            ]);
-            ".gitcode/settings.json настройка хуков"
+            body.push(format!(
+                "Настроено обработчиков: {}",
+                agent.tools.hooks().len()
+            ));
+            body.push("PreToolUse может запретить вызов; PostToolUse получает результат.".into());
+            body.push("Запускаются только явно настроенные доверенные команды.".into());
+            "~/.gitcode/config.toml · docs/hooks.md"
         }
         "skills" => {
             let home_clone = home.clone();

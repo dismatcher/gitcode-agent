@@ -10,7 +10,7 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// Maximum output bytes returned from an MCP tool or resource call before truncation.
 pub const MAX_MCP_OUTPUT_BYTES: usize = 100_000;
@@ -289,6 +289,145 @@ impl StdioMcpClient {
             })
             .unwrap_or_else(|| result.to_string());
         Ok(bound_output(text))
+    }
+}
+
+/// Reusable stdio connection owned by one workspace executor.
+pub(crate) struct StdioMcpSession {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
+    timeout: Duration,
+}
+
+impl StdioMcpSession {
+    pub(crate) async fn connect(
+        command: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let mut cmd = crate::platform::mcp_command(command, args)?;
+        cmd.envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|_| "cannot spawn stdio MCP server")?;
+        let stdin = child.stdin.take().ok_or("missing MCP stdin")?;
+        let stdout = BufReader::new(child.stdout.take().ok_or("missing MCP stdout")?);
+        let mut session = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 2,
+            timeout,
+        };
+        tokio::time::timeout(timeout, async {
+            session
+                .send(
+                    &json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params": {
+                        "protocolVersion":"2024-11-05", "capabilities":{},
+                        "clientInfo":{"name":"gitcode", "version":env!("CARGO_PKG_VERSION")}
+                    }}),
+                )
+                .await?;
+            let initialized = session.receive(1).await?;
+            if initialized["protocolVersion"].as_str() != Some("2024-11-05") {
+                return Err("unsupported MCP protocol version".into());
+            }
+            session
+                .send(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}))
+                .await
+        })
+        .await
+        .map_err(|_| "MCP stdio initialization timed out".to_owned())??;
+        Ok(session)
+    }
+
+    async fn send(&mut self, value: &Value) -> Result<(), String> {
+        let mut data = serde_json::to_vec(value).map_err(|_| "cannot encode MCP request")?;
+        data.push(b'\n');
+        self.stdin
+            .write_all(&data)
+            .await
+            .map_err(|_| "cannot write to MCP server")?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|_| "cannot flush MCP stdin".into())
+    }
+
+    async fn receive(&mut self, id: u64) -> Result<Value, String> {
+        const MAX_LINE: u64 = 2 * 1024 * 1024;
+        for _ in 0..1024 {
+            let mut bytes = Vec::new();
+            let size = (&mut self.stdout)
+                .take(MAX_LINE + 1)
+                .read_until(b'\n', &mut bytes)
+                .await
+                .map_err(|_| "cannot read MCP stdout")?;
+            if size == 0 {
+                return Err("MCP server closed stream before responding".into());
+            }
+            if size as u64 > MAX_LINE || !bytes.ends_with(b"\n") {
+                return Err("MCP response line too large or incomplete".into());
+            }
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let response: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid MCP JSON-RPC line")?;
+            if response["jsonrpc"].as_str() != Some("2.0") {
+                return Err("invalid MCP JSON-RPC version".into());
+            }
+            if response["id"].as_u64() == Some(id) {
+                if response.get("error").is_some() {
+                    return Err("MCP server returned an error".into());
+                }
+                return response
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| "MCP response has no result".into());
+            }
+        }
+        Err("too many unrelated MCP messages".into())
+    }
+
+    pub(crate) async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<String, String> {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or("MCP request ID exhausted")?;
+        let timeout = self.timeout;
+        let result = tokio::time::timeout(timeout, async {
+            self.send(&json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{"name":name,"arguments":arguments}})).await?;
+            self.receive(id).await
+        }).await.map_err(|_| "MCP stdio request timed out".to_owned())??;
+        if result["isError"].as_bool() == Some(true) {
+            return Err("MCP tool returned an error".into());
+        }
+        let text = result["content"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| result.to_string());
+        Ok(bound_output(text))
+    }
+
+    pub(crate) async fn close(mut self) {
+        let _ = self.child.kill().await;
     }
 }
 
