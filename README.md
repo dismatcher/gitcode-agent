@@ -1,12 +1,29 @@
-# <img src="assets/icons/sakura.svg" alt="" width="32" height="32"> GitCode
+<p align="center">
+  <img src="assets/icons/sakura.svg" alt="GitCode" width="72" height="72">
+</p>
 
-[![Latest release](https://img.shields.io/github/v/release/jaddd14/gitcode-agent?style=flat-square&label=release&logo=github&logoColor=white&color=c87591&labelColor=29232b)](https://github.com/jaddd14/gitcode-agent/releases/latest)
-[![CI](https://img.shields.io/github/actions/workflow/status/jaddd14/gitcode-agent/ci.yml?branch=main&style=flat-square&label=CI&logo=githubactions&logoColor=white&labelColor=29232b)](https://github.com/jaddd14/gitcode-agent/actions/workflows/ci.yml)
-[![Release builds](https://img.shields.io/github/actions/workflow/status/jaddd14/gitcode-agent/deploy.yml?branch=v0.3.2&style=flat-square&label=build%20v0.3.2&logo=githubactions&logoColor=white&labelColor=29232b)](https://github.com/jaddd14/gitcode-agent/actions/workflows/deploy.yml?query=branch%3Av0.3.2)
-[![Rust](https://img.shields.io/badge/Rust-1.99%2B-c87591?style=flat-square&logo=rust&logoColor=white&labelColor=29232b)](rust-toolchain.toml)
-[![License: MIT](https://img.shields.io/github/license/jaddd14/gitcode-agent?style=flat-square&label=license&color=c87591&labelColor=29232b)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-c87591?style=flat-square&labelColor=29232b)](https://github.com/jaddd14/gitcode-agent/releases/latest)
-[![Dependencies](https://img.shields.io/badge/dependencies-Cargo-c87591?style=flat-square&logo=rust&logoColor=white&labelColor=29232b)](Cargo.toml)
+<h1 align="center">GitCode</h1>
+
+<p align="center">The local-first terminal coding agent.</p>
+
+<p align="center">
+  <a href="https://github.com/jaddd14/gitcode-agent/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/jaddd14/gitcode-agent?style=flat-square&labelColor=29232b"></a>
+  <a href="https://github.com/jaddd14/gitcode-agent/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/jaddd14/gitcode-agent/ci.yml?branch=main&style=flat-square&label=CI&labelColor=29232b"></a>
+  <a href="https://github.com/jaddd14/gitcode-agent/actions/workflows/deploy.yml"><img alt="Deploy" src="https://img.shields.io/github/actions/workflow/status/jaddd14/gitcode-agent/deploy.yml?branch=main&style=flat-square&label=deploy&labelColor=29232b"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.99+" src="https://img.shields.io/badge/Rust-1.99%2B-c87591?style=flat-square&logo=rust&logoColor=white&labelColor=29232b"></a>
+  <a href="https://github.com/jaddd14/gitcode-agent/releases/latest"><img alt="Platforms" src="https://img.shields.io/badge/Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-c87591?style=flat-square&label=platforms&labelColor=29232b"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/jaddd14/gitcode-agent?style=flat-square&label=license&color=c87591&labelColor=29232b"></a>
+  <a href="https://github.com/jaddd14/gitcode-agent/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/jaddd14/gitcode-agent?style=flat-square&label=stars&labelColor=29232b"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="docs/providers.md">Providers</a> ·
+  <a href="docs/configuration.md">Configuration</a> ·
+  <a href="docs/permissions.md">Permissions</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
 
 GitCode is a local-first terminal coding agent written in Rust. It works with an existing repository, uses a configured language-model provider to investigate and change code, and asks for permission before actions that change files, run shell commands, or access network tools.
 
