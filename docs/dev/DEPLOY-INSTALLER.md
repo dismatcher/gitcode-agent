@@ -2,7 +2,23 @@
 
 ## Status
 
-The custom-domain endpoint is **to be enabled**. This document is an operator handoff, not evidence that the endpoint is live. No web-server configuration or service reload is performed by the build scripts. Publish only after native Linux, macOS and Windows CI, installer smoke jobs, Security and release checks pass.
+The custom-domain endpoint is **live** at `https://api.samp.team/gitcode/` and serves `latest.json` **0.3.2**, assembled from the published GitHub release of the same tag. Earlier it served 0.3.0, whose Linux archives required glibc 2.39 and aborted with `version 'GLIBC_2.39' not found` on Ubuntu 22.04; that tree remains on disk at `v0.3.0/` for history but nothing points at it any more. The 0.3.2 archives need glibc 2.34, and a clean-home `install.sh` run installs and starts a working binary.
+
+Publish only after native Linux, macOS and Windows CI, installer smoke jobs, Security and release checks pass. No web-server configuration or service reload is performed by the build scripts.
+
+## Rebuilding the served tree
+
+`scripts/assemble-dist.sh <version> <empty-output-dir>` downloads the release archives over HTTPS, verifies every sha256 against the release `SHA256SUMS`, normalizes asset names, and writes `latest.json`, `SHA256SUMS` and both installers. It refuses to overwrite an existing output directory, so assemble into a fresh path, then copy over `/srv/www/api/gitcode/` and `/srv/www/api/gitcode-root/`.
+
+Verify the live endpoint after any upload:
+
+```sh
+curl -fsS https://api.samp.team/gitcode/latest.json
+curl -fsSI https://api.samp.team/gitcode/v0.3.2/gitcode-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Then install into a throwaway home directory and run `--version`, because a manifest that resolves is not proof that the binary starts on the reader's glibc.
+
 
 ## Assemble and verify
 
