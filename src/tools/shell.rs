@@ -389,6 +389,8 @@ pub struct CompletedJob {
     pub exit_code: Option<i32>,
     /// Whether the deadline expired.
     pub timed_out: bool,
+    /// Whether output exceeded the capture limit.
+    pub truncated: bool,
     /// Worker failure, if any.
     pub error: Option<String>,
     /// Wall-clock duration in milliseconds.
@@ -515,6 +517,7 @@ impl Session {
                     output: bytes,
                     exit_code: output.exit_code,
                     timed_out: output.timed_out,
+                    truncated: output.truncated,
                     error: None,
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 },
@@ -522,6 +525,10 @@ impl Session {
                     output: bytes,
                     exit_code: None,
                     timed_out: false,
+                    truncated: task_capture
+                        .lock()
+                        .map(|capture| capture.truncated)
+                        .unwrap_or(false),
                     error: Some(error.clone()),
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 },
